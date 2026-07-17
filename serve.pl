@@ -4,7 +4,7 @@ use warnings;
 use Socket;
 use File::Basename;
 use File::Spec;
-use POSIX qw(strftime);
+use POSIX qw(strftime :termios_h);
 use Errno qw(EINTR);
 use Cwd 'realpath';
 use URI::Escape;
@@ -82,11 +82,46 @@ my %MIME_TYPES = (
     otf   => 'font/otf',
 );
 
-my $reset  = "\e[0m";
-my $bright = "\e[1m";
-my $cyan   = "\e[96m";
-my $magenta = "\e[95m";
-my $yellow = "\e[93m";
+# ======================
+# TUI color scheme
+#   FRAME - structural chrome: borders, separators, rules
+#   LABEL - section titles and field names
+#   VALUE - data: paths, IPs, sizes, timestamps, URLs
+#   GOOD  - healthy/live state, 2xx-3xx responses, follow mode
+#   WARN  - degraded state, 4xx responses, scrolled mode, warnings
+#   BAD   - errors/dead state, 5xx responses
+#   MUTED - secondary text: hints, ages, counters
+# ======================
+my $RESET = "\e[0m";
+my $FRAME = "\e[95m";
+my $LABEL = "\e[1;96m";
+my $VALUE = "\e[97m";
+my $GOOD  = "\e[92m";
+my $WARN  = "\e[93m";
+my $BAD   = "\e[91m";
+my $MUTED = "\e[90m";
+
+$| = 1;
+
+my $IS_TTY = -t STDOUT;
+my ($TERM_ROWS, $TERM_COLS) = terminal_size();
+my $BAR_HEIGHT = 5;
+
+my $last_hot_reload;
+my $last_poll_epoch;
+my $poll_count    = 0;
+my $request_count = 0;
+
+my @log_lines;
+my $scroll_offset  = 0;
+my $MAX_LOG_LINES  = 2000;
+my $termios_orig;
+
+$SIG{WINCH} = sub {
+    ($TERM_ROWS, $TERM_COLS) = terminal_size();
+    clamp_scroll();
+    redraw_screen();
+};
 
 my $SECURITY_HEADERS =
     "X-Content-Type-Options: nosniff\r\n" .
@@ -102,12 +137,16 @@ setsockopt($server, SOL_SOCKET, SO_REUSEADDR, 1) or die "setsockopt: $!";
 bind($server, sockaddr_in($PORT, inet_aton($HOST))) or die "bind: $!";
 listen($server, SOMAXCONN) or die "listen: $!";
 
-print "#" x 80 . "\n";
-print "Server running at http://$HOST:$PORT/\n";
-print "Web root: $REAL_WEB_ROOT\n";
-print "Listening for requests...\n";
-print "WARNING: For local development only!\n";
-print "#" x 80 . "\n" x 2;
+tui_init();
+
+log_output(
+    $FRAME . ("#" x 80) . $RESET . "\n" .
+    "${LABEL}Server running at$RESET ${VALUE}http://$HOST:$PORT/$RESET\n" .
+    "${LABEL}Web root:$RESET $VALUE$REAL_WEB_ROOT$RESET\n" .
+    "${LABEL}Listening for requests...$RESET\n" .
+    "${WARN}WARNING: For local development only!$RESET\n" .
+    $FRAME . ("#" x 80) . $RESET . "\n\n"
+);
 
 # ======================
 # Main loop
@@ -116,13 +155,30 @@ print "#" x 80 . "\n" x 2;
 my $stream_counter = 0;
 my $last_time = time() - 5;
 
+my $rin = '';
+vec($rin, fileno($server), 1) = 1;
+vec($rin, fileno(STDIN), 1) = 1 if $IS_TTY;
+
 while (1) {
-    my $client;
-    my $client_addr = accept($client, $server) or next;
+    my $rout = $rin;
+    my $ready = select($rout, undef, undef, 1);
+    next if !defined $ready || $ready < 0;
 
-    handle_client($client, $client_addr);
+    if ($ready == 0) {
+        draw_status_bar();
+        next;
+    }
 
-    close $client if $client;
+    handle_keys() if $IS_TTY && vec($rout, fileno(STDIN), 1);
+
+    if (vec($rout, fileno($server), 1)) {
+        my $client;
+        my $client_addr = accept($client, $server) or next;
+
+        handle_client($client, $client_addr);
+
+        close $client if $client;
+    }
 }
 
 sub handle_client {
@@ -197,9 +253,15 @@ sub handle_client {
         }
 
         if ($HOT_RELOAD && $path =~ m{^\Q$HOT_RELOAD_PATH\E(?:[?#]|$)}) {
-            send_response($client, 200, "OK", "text/plain", web_root_signature(), $client_ip, $path);
+            $last_hot_reload = strftime("%Y-%m-%d %H:%M:%S", localtime);
+            $last_poll_epoch = time();
+            $poll_count++;
+            send_response($client, 200, "OK", "text/plain", web_root_signature(), $client_ip, $path, quiet => 1);
+            draw_status_bar();
             return;
         }
+
+        $request_count++;
 
         my $file_path = sanitize_path($path);
         if (!$file_path) {
@@ -217,7 +279,7 @@ sub handle_client {
     return unless $error;
 
     if ($error =~ /timeout/) {
-        print "Request timeout from client\n";
+        log_output("${WARN}Request timeout from client$RESET\n");
         send_response($client, 408, "Request Timeout", "text/plain", "Timeout", 'unknown', undef);
     }
     else {
@@ -235,16 +297,182 @@ sub start_stream_banner {
     $stream_message =~ s/\e//g;
 
     my $line = '=' x 80;
-    my $space = ' ' x 80;
 
-    print "\n";
-    print $cyan . $space . $reset . "\n";
-    print $bright . $magenta . $line . $reset . "\n";
-    print $bright . $yellow . "STARTING STREAM..." . $reset . "\n";
-    print $bright . $cyan . "$stream_message" . $reset . "\n";
-    print $bright . $magenta . $line . $reset . "\n";
-    print $cyan . $space . $reset . "\n";
-    print "\n";
+    my $output = "\n\n";
+    $output .= $FRAME . $line . $RESET . "\n";
+    $output .= $LABEL . "STARTING STREAM..." . $RESET . "\n";
+    $output .= $VALUE . $stream_message . $RESET . "\n";
+    $output .= $FRAME . $line . $RESET . "\n";
+    $output .= "\n\n";
+
+    log_output($output);
+}
+
+sub terminal_size {
+    return (24, 80) unless -t STDOUT;
+    my $size = qx(stty size 2>/dev/null);
+    return ($size && $size =~ /^(\d+)\s+(\d+)/) ? ($1, $2) : (24, 80);
+}
+
+sub tui_init {
+    return unless $IS_TTY;
+
+    $termios_orig = POSIX::Termios->new;
+    $termios_orig->getattr(fileno(STDIN));
+
+    my $raw = POSIX::Termios->new;
+    $raw->getattr(fileno(STDIN));
+    $raw->setlflag($raw->getlflag & ~(ECHO | ICANON));
+    $raw->setcc(VMIN, 0);
+    $raw->setcc(VTIME, 0);
+    $raw->setattr(fileno(STDIN), TCSANOW);
+
+    $SIG{INT} = $SIG{TERM} = sub { exit 0 };
+
+    print "\e[?1049h\e[?25l\e[?7l\e[2J";
+    redraw_screen();
+}
+
+sub log_height {
+    my $height = $TERM_ROWS - $BAR_HEIGHT;
+    return $height < 1 ? 1 : $height;
+}
+
+sub clamp_scroll {
+    my $max = @log_lines - log_height();
+    $max = 0 if $max < 0;
+    $scroll_offset = $max if $scroll_offset > $max;
+    $scroll_offset = 0 if $scroll_offset < 0;
+}
+
+sub redraw_screen {
+    return unless $IS_TTY;
+
+    my $height = log_height();
+    my $end    = $#log_lines - $scroll_offset;
+    my $start  = $end - $height + 1;
+
+    my $out = '';
+    for my $row (1 .. $height) {
+        my $idx = $start + $row - 1;
+        my $line = ($idx >= 0 && $idx <= $end) ? $log_lines[$idx] : '';
+        $out .= "\e[${row};1H\e[0m\e[2K" . $line;
+    }
+    print $out;
+
+    draw_status_bar();
+}
+
+sub strip_len {
+    my ($text) = @_;
+    $text =~ s/\e\[[0-9;]*m//g;
+    return length $text;
+}
+
+sub bar_content {
+    my ($left, $right) = @_;
+    $right //= '';
+
+    my $inner = $TERM_COLS - 2;
+    my $pad   = $inner - 2 - strip_len($left) - strip_len($right);
+    $pad = 1 if $pad < 1;
+
+    return $FRAME . '|' . $RESET . ' ' . $left
+         . (' ' x $pad)
+         . $right . ' ' . $FRAME . '|' . $RESET;
+}
+
+sub draw_status_bar {
+    return unless $IS_TTY;
+
+    my $inner = $TERM_COLS - 2;
+
+    my $poll;
+    if (defined $last_poll_epoch) {
+        my $age = time() - $last_poll_epoch;
+        my $age_str = $age < 2  ? 'just now'
+                    : $age < 60 ? "${age}s ago"
+                    : sprintf('%dm %ds ago', $age / 60, $age % 60);
+        my $dot_color = $age <= 3 ? $GOOD : $age <= 10 ? $WARN : $BAD;
+        $poll = "$dot_color*$RESET ${LABEL}Hot reload$RESET "
+              . "${MUTED}- last poll$RESET $VALUE$last_hot_reload$RESET "
+              . "$MUTED($age_str)$RESET";
+    }
+    else {
+        $poll = "${MUTED}o$RESET ${LABEL}Hot reload$RESET "
+              . "${MUTED}- waiting for first poll...$RESET";
+    }
+
+    my $title  = "${LABEL}OVERPORT DEV SERVER$RESET";
+    my $url    = "\e[4m${VALUE}http://$HOST:$PORT/$RESET";
+    my $counts = "${MUTED}polls $poll_count | reqs $request_count$RESET";
+
+    my $keys = "${MUTED}Up/Down PgUp/PgDn scroll | Home top | End follow | q quit$RESET";
+    my $mode = $scroll_offset > 0
+        ? "$WARN^ SCROLLED +$scroll_offset$RESET"
+        : "$GOOD>> FOLLOWING$RESET";
+
+    my @rows = (
+        $FRAME . '+' . ('-' x $inner) . '+' . $RESET,
+        bar_content($title, $url),
+        bar_content($poll,  $counts),
+        bar_content($keys,  $mode),
+        $FRAME . '+' . ('-' x $inner) . '+' . $RESET,
+    );
+
+    my $top = $TERM_ROWS - $BAR_HEIGHT + 1;
+    my $out = '';
+    for my $i (0 .. $#rows) {
+        my $row = $top + $i;
+        $out .= "\e[${row};1H\e[0m\e[2K" . $rows[$i];
+    }
+    print $out;
+}
+
+sub handle_keys {
+    my $buf = '';
+    sysread(STDIN, $buf, 256);
+    return unless length $buf;
+
+    my $page = log_height() - 1;
+    $page = 1 if $page < 1;
+    my $before = $scroll_offset;
+
+    while (length $buf) {
+        if    ($buf =~ s/^\e\[5~//)              { $scroll_offset += $page; }
+        elsif ($buf =~ s/^\e\[6~//)              { $scroll_offset -= $page; }
+        elsif ($buf =~ s/^(?:\e\[A|\eOA)//)      { $scroll_offset += 1; }
+        elsif ($buf =~ s/^(?:\e\[B|\eOB)//)      { $scroll_offset -= 1; }
+        elsif ($buf =~ s/^(?:\e\[H|\e\[1~|\eOH)//) { $scroll_offset = scalar @log_lines; }
+        elsif ($buf =~ s/^(?:\e\[F|\e\[4~|\eOF)//) { $scroll_offset = 0; }
+        elsif ($buf =~ s/^q//)                   { exit 0; }
+        else                                     { substr($buf, 0, 1, ''); }
+    }
+
+    clamp_scroll();
+    redraw_screen() if $scroll_offset != $before;
+}
+
+sub log_output {
+    my ($content) = @_;
+
+    unless ($IS_TTY) {
+        print $content;
+        return;
+    }
+
+    my @lines = split(/\n/, $content, -1);
+    pop @lines if @lines && $lines[-1] eq '';
+
+    push @log_lines, @lines;
+    $scroll_offset += @lines if $scroll_offset > 0;
+
+    if (@log_lines > $MAX_LOG_LINES) {
+        splice(@log_lines, 0, @log_lines - $MAX_LOG_LINES);
+    }
+
+    clamp_scroll();
+    redraw_screen();
 }
 
 # ======================
@@ -492,7 +720,7 @@ sub serve_404 {
 # Generic responses
 # ======================
 sub send_response {
-    my ($client, $code, $status, $type, $body, $client_ip, $file_path) = @_;
+    my ($client, $code, $status, $type, $body, $client_ip, $file_path, %opts) = @_;
 
     my $response =
         "HTTP/1.1 $code $status\r\n" .
@@ -510,7 +738,7 @@ sub send_response {
         code       => $code,
         status     => $status,
         content    => $response
-    );
+    ) unless $opts{quiet};
 
     syswrite($client, $response);
 }
@@ -530,37 +758,45 @@ sub log_packet {
 
     my $output = '';
 
-    $output .= "\n\033[1;36m$separator\033[0m\n";
-    $output .= "\033[1;33m| PACKET DETAILS (\033[1;37m$params{type}\033[1;33m) at \033[1;35m$timestamp\033[0m\n";
-    $output .= "\033[1;36m$subseparator\033[0m\n";
+    $output .= "\n$FRAME$separator$RESET\n";
+    $output .= "$LABEL| PACKET DETAILS ($RESET$VALUE$params{type}$RESET$LABEL) at $RESET$VALUE$timestamp$RESET\n";
+    $output .= "$FRAME$subseparator$RESET\n";
 
-    $output .= "\033[1;32m| Client:\033[0m     \033[1;37m$params{client_ip}\033[0m\n";
+    $output .= "$LABEL| Client:$RESET     $VALUE$params{client_ip}$RESET\n";
 
-    $output .= "\033[1;32m| File:\033[0m       \033[1;37m$safe_file_path\033[0m\n"
+    $output .= "$LABEL| File:$RESET       $VALUE$safe_file_path$RESET\n"
         if exists $params{file_path};
 
-    $output .= "\033[1;32m| Status:\033[0m     \033[1;37m$params{code} $params{status}\033[0m\n"
-        if exists $params{code};
+    if (exists $params{code}) {
+        my $status_color = $params{code} >= 500 ? $BAD
+                         : $params{code} >= 400 ? $WARN
+                         : $GOOD;
+        $output .= "$LABEL| Status:$RESET     $status_color$params{code} $params{status}$RESET\n";
+    }
 
-    $output .= "\033[1;32m| MIME Type:\033[0m  \033[1;37m$params{mime_type}\033[0m\n"
+    $output .= "$LABEL| MIME Type:$RESET  $VALUE$params{mime_type}$RESET\n"
         if exists $params{mime_type};
 
-    $output .= "\033[1;32m| Size:\033[0m       \033[1;37m$params{size} bytes\033[0m\n";
+    $output .= "$LABEL| Size:$RESET       $VALUE$params{size} bytes$RESET\n";
 
-    $output .= "\033[1;32m| File Size:\033[0m  \033[1;37m$params{file_size} bytes\033[0m\n"
+    $output .= "$LABEL| File Size:$RESET  $VALUE$params{file_size} bytes$RESET\n"
         if exists $params{file_size};
 
-    $output .= "\033[1;32m| Packet #:\033[0m   \033[1;37m$params{packet_num}\033[0m\n"
+    $output .= "$LABEL| Packet #:$RESET   $VALUE$params{packet_num}$RESET\n"
         if exists $params{packet_num};
 
-    $output .= "\033[1;32m| Progress:\033[0m   \033[1;37m$params{progress}%\033[0m\n"
+    $output .= "$LABEL| Progress:$RESET   $VALUE$params{progress}%$RESET\n"
         if exists $params{progress};
 
-    $output .= "\033[1;36m$separator\033[0m\n\n";
+    $output .= "$FRAME$separator$RESET\n\n";
 
-    print $output;
+    log_output($output);
 }
 
 END {
+    if ($IS_TTY) {
+        print "\e[?7h\e[?25h\e[0m\e[?1049l";
+        $termios_orig->setattr(fileno(STDIN), TCSANOW) if $termios_orig;
+    }
     close $server if $server;
 }
