@@ -141,18 +141,21 @@ my @STAR_LAYERS = (
         char    => '.',
         density => 35,
         colors  => ["\e[2;34m", "\e[38;5;60m", "\e[38;5;66m", "\e[38;5;95m"],
+        twinkle => "\e[94m",
     },
     {
         speed   => 0.50,
         char    => '+',
         density => 24,
         colors  => ["\e[34m", "\e[38;5;104m", "\e[38;5;130m", "\e[38;5;96m"],
+        twinkle => "\e[1;94m",
     },
     {
         speed   => 0.75,
         char    => '*',
         density => 15,
         colors  => ["\e[94m", "\e[38;5;111m", "\e[38;5;208m", "\e[38;5;135m"],
+        twinkle => "\e[1;38;5;153m",
     },
 );
 
@@ -203,7 +206,7 @@ while (1) {
     next if !defined $ready || $ready < 0;
 
     if ($ready == 0) {
-        draw_status_bar();
+        redraw_screen();
         next;
     }
 
@@ -486,6 +489,11 @@ sub star_field_row {
             my $col = int($v / 100) % $TERM_COLS + 1;
 
             my $color = $l->{colors}[hex(substr($hash, 28 + $i, 1)) % @{$l->{colors}}];
+
+            my $phase  = $v % 7;
+            my $bucket = int((time() + $phase) / 3);
+            my $flare  = hex(substr(md5_hex("twinkle:$star_seed:$layer:$world:$i:$bucket"), 0, 8)) % 100;
+            $color = $l->{twinkle} if $flare < 6;
 
             $out .= "\e[${row};${col}H$color$l->{char}$RESET";
         }
