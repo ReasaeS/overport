@@ -25,6 +25,7 @@ my $ROOT_PREFIX = $REAL_WEB_ROOT =~ m{/$} ? $REAL_WEB_ROOT : $REAL_WEB_ROOT . '/
 
 my $INDEX_FILE  = File::Spec->catfile($REAL_WEB_ROOT, 'index.html');
 my $PAGE_404    = File::Spec->catfile(dirname(__FILE__), 'status', 'status.html');
+my $REAL_PAGE_404 = eval { realpath($PAGE_404) };
 my $BUFFER_SIZE = 8192;
 my $MAX_REQUEST_SIZE = 16384;
 my $READ_TIMEOUT = 5;
@@ -106,6 +107,7 @@ $| = 1;
 my $IS_TTY = -t STDOUT;
 my ($TERM_ROWS, $TERM_COLS) = terminal_size();
 my $BAR_HEIGHT = 5;
+my $LOG_WIDTH  = 80;
 
 my $last_hot_reload;
 my $last_poll_epoch;
@@ -116,6 +118,30 @@ my @log_lines;
 my $scroll_offset  = 0;
 my $MAX_LOG_LINES  = 2000;
 my $termios_orig;
+
+# Star colors are deliberately kept off the TUI color scheme (bright magenta/
+# cyan/white/green/yellow/red/grey): blues, indigo, teal, violet, and orange
+# tones only, dimmer for far layers and brighter for near ones.
+my @STAR_LAYERS = (
+    {
+        speed   => 0.25,
+        char    => '.',
+        density => 35,
+        colors  => ["\e[2;34m", "\e[38;5;60m", "\e[38;5;66m", "\e[38;5;95m"],
+    },
+    {
+        speed   => 0.50,
+        char    => '+',
+        density => 24,
+        colors  => ["\e[34m", "\e[38;5;104m", "\e[38;5;130m", "\e[38;5;96m"],
+    },
+    {
+        speed   => 0.75,
+        char    => '*',
+        density => 15,
+        colors  => ["\e[94m", "\e[38;5;111m", "\e[38;5;208m", "\e[38;5;135m"],
+    },
+);
 
 $SIG{WINCH} = sub {
     ($TERM_ROWS, $TERM_COLS) = terminal_size();
@@ -139,13 +165,14 @@ listen($server, SOMAXCONN) or die "listen: $!";
 
 tui_init();
 
-log_output(
-    $FRAME . ("#" x 80) . $RESET . "\n" .
-    "${LABEL}Server running at$RESET ${VALUE}http://$HOST:$PORT/$RESET\n" .
-    "${LABEL}Web root:$RESET $VALUE$REAL_WEB_ROOT$RESET\n" .
-    "${LABEL}Listening for requests...$RESET\n" .
-    "${WARN}WARNING: For local development only!$RESET\n" .
-    $FRAME . ("#" x 80) . $RESET . "\n\n"
+push_log_records(
+    make_rule('#'),
+    make_line("${LABEL}Server running at$RESET ${VALUE}http://$HOST:$PORT/$RESET", 'center'),
+    make_line("${LABEL}Web root:$RESET $VALUE$REAL_WEB_ROOT$RESET", 'center'),
+    make_line("${LABEL}Listening for requests...$RESET", 'center'),
+    make_line("${WARN}WARNING: For local development only!$RESET", 'center'),
+    make_rule('#'),
+    make_line(''),
 );
 
 # ======================
@@ -188,16 +215,6 @@ sub handle_client {
 
     eval {
         local $SIG{ALRM} = sub { die "timeout\n" };
-
-        my $now_time = time();
-        my $delta_time = $now_time - $last_time;
-        $last_time = $now_time;
-
-        if ($delta_time >= 5) {
-            my $stream_message = "STREAM ID: #$stream_counter" ;
-            $stream_counter++;
-            start_stream_banner($stream_message);
-        }
 
         binmode($client);
         setsockopt($client, SOL_SOCKET, SO_SNDTIMEO, pack('l!l!', $SEND_STALL_TIMEOUT, 0));
@@ -296,16 +313,16 @@ sub start_stream_banner {
 
     $stream_message =~ s/\e//g;
 
-    my $line = '=' x 80;
-
-    my $output = "\n\n";
-    $output .= $FRAME . $line . $RESET . "\n";
-    $output .= $LABEL . "STARTING STREAM..." . $RESET . "\n";
-    $output .= $VALUE . $stream_message . $RESET . "\n";
-    $output .= $FRAME . $line . $RESET . "\n";
-    $output .= "\n\n";
-
-    log_output($output);
+    push_log_records(
+        make_line(''),
+        make_line(''),
+        make_rule('='),
+        make_line($LABEL . "STARTING STREAM..." . $RESET, 'center'),
+        make_line($VALUE . $stream_message . $RESET, 'center'),
+        make_rule('='),
+        make_line(''),
+        make_line(''),
+    );
 }
 
 sub terminal_size {
@@ -345,6 +362,38 @@ sub clamp_scroll {
     $scroll_offset = 0 if $scroll_offset < 0;
 }
 
+sub make_line {
+    my ($text, $align) = @_;
+    return { text => $text // '', align => $align // 'block' };
+}
+
+sub make_rule {
+    my ($char) = @_;
+    return { rule => $char };
+}
+
+sub star_field_row {
+    my ($row) = @_;
+
+    my $out = '';
+    for my $layer (0 .. $#STAR_LAYERS) {
+        my $l = $STAR_LAYERS[$layer];
+        my $world = $row - int($scroll_offset * $l->{speed});
+        my $hash = md5_hex("stars:$layer:$world");
+
+        for my $i (0 .. 2) {
+            my $v = hex(substr($hash, $i * 8, 8));
+            next unless ($v % 100) < $l->{density};
+            my $col = int($v / 100) % $TERM_COLS + 1;
+
+            my $color = $l->{colors}[hex(substr($hash, 28 + $i, 1)) % @{$l->{colors}}];
+
+            $out .= "\e[${row};${col}H$color$l->{char}$RESET";
+        }
+    }
+    return $out;
+}
+
 sub redraw_screen {
     return unless $IS_TTY;
 
@@ -355,8 +404,23 @@ sub redraw_screen {
     my $out = '';
     for my $row (1 .. $height) {
         my $idx = $start + $row - 1;
-        my $line = ($idx >= 0 && $idx <= $end) ? $log_lines[$idx] : '';
-        $out .= "\e[${row};1H\e[0m\e[2K" . $line;
+        my $rec = ($idx >= 0 && $idx <= $end) ? $log_lines[$idx] : undef;
+
+        $out .= "\e[${row};1H\e[0m\e[2K";
+
+        if ($rec && $rec->{rule}) {
+            $out .= $FRAME . ($rec->{rule} x $TERM_COLS) . $RESET;
+            next;
+        }
+
+        $out .= star_field_row($row);
+
+        if ($rec && length $rec->{text}) {
+            my $width = $rec->{align} eq 'center' ? strip_len($rec->{text}) : $LOG_WIDTH;
+            my $col = int(($TERM_COLS - $width) / 2) + 1;
+            $col = 1 if $col < 1;
+            $out .= "\e[${row};${col}H" . $rec->{text};
+        }
     }
     print $out;
 
@@ -453,19 +517,20 @@ sub handle_keys {
     redraw_screen() if $scroll_offset != $before;
 }
 
-sub log_output {
-    my ($content) = @_;
+sub push_log_records {
+    my (@records) = @_;
 
     unless ($IS_TTY) {
-        print $content;
+        for my $rec (@records) {
+            print $rec->{rule}
+                ? $FRAME . ($rec->{rule} x $LOG_WIDTH) . $RESET . "\n"
+                : $rec->{text} . "\n";
+        }
         return;
     }
 
-    my @lines = split(/\n/, $content, -1);
-    pop @lines if @lines && $lines[-1] eq '';
-
-    push @log_lines, @lines;
-    $scroll_offset += @lines if $scroll_offset > 0;
+    push @log_lines, @records;
+    $scroll_offset += @records if $scroll_offset > 0;
 
     if (@log_lines > $MAX_LOG_LINES) {
         splice(@log_lines, 0, @log_lines - $MAX_LOG_LINES);
@@ -473,6 +538,15 @@ sub log_output {
 
     clamp_scroll();
     redraw_screen();
+}
+
+sub log_output {
+    my ($content, $align) = @_;
+
+    my @lines = split(/\n/, $content, -1);
+    pop @lines if @lines && $lines[-1] eq '';
+
+    push_log_records(map { make_line($_, $align) } @lines);
 }
 
 # ======================
@@ -707,10 +781,15 @@ sub serve_403 {
 sub serve_404 {
     my ($client, $client_ip, $requested_path) = @_;
 
-    my $real_404 = eval { realpath($PAGE_404) };
-    if ($real_404 && -f $real_404 && -r _) {
-        serve_static($client, $real_404, $client_ip, 404, "Not Found");
-        return;
+    my ($ext) = ($requested_path // '') =~ /\.([^.\/]+)$/;
+    my $wants_html = defined $ext && lc($ext) =~ /^html?$/;
+
+    if ($wants_html) {
+        my $real_404 = eval { realpath($PAGE_404) };
+        if ($real_404 && -f $real_404 && -r _) {
+            serve_static($client, $real_404, $client_ip, 404, "Not Found");
+            return;
+        }
     }
 
     send_response($client, 404, "Not Found", "text/plain", "File not found", $client_ip, $requested_path);
@@ -746,46 +825,91 @@ sub send_response {
 # ======================
 # Packet logger
 # ======================
+sub truncate_text {
+    my ($text, $max) = @_;
+    return $text if length($text) <= $max;
+    $max = 3 if $max < 3;
+    return substr($text, 0, $max - 3) . '...';
+}
+
+sub log_row {
+    my ($content) = @_;
+    my $pad = $LOG_WIDTH - 4 - strip_len($content);
+    $pad = 0 if $pad < 0;
+    return "$FRAME|$RESET " . $content . (' ' x $pad) . " $FRAME|$RESET\n";
+}
+
+sub field_row {
+    my ($label, $value, $color) = @_;
+    $color //= $VALUE;
+
+    my $value_max = $LOG_WIDTH - 4 - 12;
+    $value = truncate_text("$value", $value_max);
+
+    return log_row($LABEL . sprintf('%-12s', $label) . $RESET . $color . $value . $RESET);
+}
+
 sub log_packet {
     my %params = @_;
+
+    my $now = time();
+    if ($now - $last_time >= 5) {
+        start_stream_banner("STREAM ID: #$stream_counter");
+        $stream_counter++;
+    }
+    $last_time = $now;
+
     my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
 
     my $safe_file_path = $params{file_path} // '';
     $safe_file_path =~ s/\e//g;
 
-    my $separator    = '=' x 80;
-    my $subseparator = '-' x 80;
+    if ($safe_file_path eq $REAL_WEB_ROOT) {
+        $safe_file_path = '/';
+    }
+    elsif (index($safe_file_path, $ROOT_PREFIX) == 0) {
+        $safe_file_path = '/' . substr($safe_file_path, length($ROOT_PREFIX));
+    }
+
+    my $separator    = '=' x $LOG_WIDTH;
+    my $subseparator = '-' x $LOG_WIDTH;
 
     my $output = '';
 
     $output .= "\n$FRAME$separator$RESET\n";
-    $output .= "$LABEL| PACKET DETAILS ($RESET$VALUE$params{type}$RESET$LABEL) at $RESET$VALUE$timestamp$RESET\n";
+    $output .= log_row("${LABEL}PACKET DETAILS ($RESET$VALUE$params{type}$RESET$LABEL) at $RESET$VALUE$timestamp$RESET");
     $output .= "$FRAME$subseparator$RESET\n";
 
-    $output .= "$LABEL| Client:$RESET     $VALUE$params{client_ip}$RESET\n";
+    $output .= field_row('Client:', $params{client_ip});
 
-    $output .= "$LABEL| File:$RESET       $VALUE$safe_file_path$RESET\n"
-        if exists $params{file_path};
+    if (exists $params{file_path}) {
+        if (defined $REAL_PAGE_404 && $safe_file_path eq $REAL_PAGE_404) {
+            $output .= field_row('File:', '[404 status page]', $WARN);
+        }
+        else {
+            $output .= field_row('File:', $safe_file_path);
+        }
+    }
 
     if (exists $params{code}) {
         my $status_color = $params{code} >= 500 ? $BAD
                          : $params{code} >= 400 ? $WARN
                          : $GOOD;
-        $output .= "$LABEL| Status:$RESET     $status_color$params{code} $params{status}$RESET\n";
+        $output .= field_row('Status:', "$params{code} $params{status}", $status_color);
     }
 
-    $output .= "$LABEL| MIME Type:$RESET  $VALUE$params{mime_type}$RESET\n"
+    $output .= field_row('MIME Type:', $params{mime_type})
         if exists $params{mime_type};
 
-    $output .= "$LABEL| Size:$RESET       $VALUE$params{size} bytes$RESET\n";
+    $output .= field_row('Size:', "$params{size} bytes");
 
-    $output .= "$LABEL| File Size:$RESET  $VALUE$params{file_size} bytes$RESET\n"
+    $output .= field_row('File Size:', "$params{file_size} bytes")
         if exists $params{file_size};
 
-    $output .= "$LABEL| Packet #:$RESET   $VALUE$params{packet_num}$RESET\n"
+    $output .= field_row('Packet #:', $params{packet_num})
         if exists $params{packet_num};
 
-    $output .= "$LABEL| Progress:$RESET   $VALUE$params{progress}%$RESET\n"
+    $output .= field_row('Progress:', "$params{progress}%")
         if exists $params{progress};
 
     $output .= "$FRAME$separator$RESET\n\n";
