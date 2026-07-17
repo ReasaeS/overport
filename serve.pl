@@ -8,6 +8,8 @@ use POSIX qw(strftime);
 use Errno qw(EINTR);
 use Cwd 'realpath';
 use URI::Escape;
+use File::Find;
+use Digest::MD5 qw(md5_hex);
 
 # ======================
 # Configuration
@@ -27,6 +29,33 @@ my $BUFFER_SIZE = 8192;
 my $MAX_REQUEST_SIZE = 16384;
 my $READ_TIMEOUT = 5;
 my $SEND_STALL_TIMEOUT = 30;
+
+my $HOT_RELOAD         = 1;
+my $HOT_RELOAD_PATH    = '/__hotreload';
+my $HOT_RELOAD_POLL_MS = 1000;
+
+my $HOT_RELOAD_SCRIPT = <<"END_SCRIPT";
+<script>
+(function () {
+    var current = null;
+    function poll() {
+        fetch('$HOT_RELOAD_PATH', { cache: 'no-store' })
+            .then(function (res) { return res.text(); })
+            .then(function (sig) {
+                if (current === null) {
+                    current = sig;
+                } else if (sig !== current) {
+                    location.reload();
+                    return;
+                }
+                setTimeout(poll, $HOT_RELOAD_POLL_MS);
+            })
+            .catch(function () { setTimeout(poll, $HOT_RELOAD_POLL_MS); });
+    }
+    poll();
+})();
+</script>
+END_SCRIPT
 
 my %MIME_TYPES = (
     html  => 'text/html',
@@ -167,6 +196,11 @@ sub handle_client {
             return;
         }
 
+        if ($HOT_RELOAD && $path =~ m{^\Q$HOT_RELOAD_PATH\E(?:[?#]|$)}) {
+            send_response($client, 200, "OK", "text/plain", web_root_signature(), $client_ip, $path);
+            return;
+        }
+
         my $file_path = sanitize_path($path);
         if (!$file_path) {
             send_response($client, 403, "Forbidden", "text/plain", "Access denied", $client_ip, $path);
@@ -286,6 +320,24 @@ sub sanitize_path {
 }
 
 # ======================
+# Hot reload
+# ======================
+sub web_root_signature {
+    my @entries;
+
+    find({
+        no_chdir => 1,
+        wanted   => sub {
+            my @st = lstat($_);
+            return unless @st;
+            push @entries, "$File::Find::name|$st[9]|$st[7]";
+        },
+    }, $REAL_WEB_ROOT);
+
+    return md5_hex(join("\n", sort @entries));
+}
+
+# ======================
 # File serving
 # ======================
 sub write_all {
@@ -333,6 +385,37 @@ sub serve_static {
         return;
     };
     binmode($fh);
+
+    if ($HOT_RELOAD && $mime_type eq 'text/html') {
+        my $body = do { local $/; <$fh> };
+        close $fh;
+
+        unless ($body =~ s{</body>}{$HOT_RELOAD_SCRIPT</body>}i) {
+            $body .= $HOT_RELOAD_SCRIPT;
+        }
+
+        my $headers =
+            "HTTP/1.1 $code $status\r\n" .
+            "Content-Type: $mime_type\r\n" .
+            "Content-Length: " . length($body) . "\r\n" .
+            "Cache-Control: no-store\r\n" .
+            $SECURITY_HEADERS .
+            "Connection: close\r\n\r\n";
+
+        log_packet(
+            type       => 'HEADERS',
+            client_ip  => $client_ip,
+            file_path  => $file_path,
+            size       => length($headers),
+            mime_type  => $mime_type,
+            file_size  => length($body),
+            content    => $headers
+        );
+
+        return unless write_all($client, $headers);
+        write_all($client, $body);
+        return;
+    }
 
     my $file_size = -s $fh;
     my $cache_control = $code == 200 ? "public, max-age=3600" : "no-store";
