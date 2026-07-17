@@ -5,19 +5,28 @@ use Socket;
 use File::Basename;
 use File::Spec;
 use POSIX qw(strftime);
-use Time::HiRes qw(sleep);
+use Errno qw(EINTR);
+use Cwd 'realpath';
+use URI::Escape;
 
 # ======================
 # Configuration
 # ======================
 my $PORT        = 9001;
-my $HOST        = '0.0.0.0';
-my $WEB_ROOT    = $ARGV[0] // File::Spec->catdir(dirname(__FILE__), '.' ); "The path of your WEB_ROOT here.";
+my $HOST        = '127.0.0.1';
+my $WEB_ROOT    = $ARGV[0] // File::Spec->catdir(dirname(__FILE__), './src' );
 
-my $INDEX_FILE  = File::Spec->catfile($WEB_ROOT, 'index.html');
+my $REAL_WEB_ROOT = realpath($WEB_ROOT);
+die "Invalid web root: $WEB_ROOT\n" unless defined $REAL_WEB_ROOT && -d $REAL_WEB_ROOT;
 
-my $PAGE_404    = File::Spec->catfile(dirname(__FILE__), 'status', '404.html');
+my $ROOT_PREFIX = $REAL_WEB_ROOT =~ m{/$} ? $REAL_WEB_ROOT : $REAL_WEB_ROOT . '/';
+
+my $INDEX_FILE  = File::Spec->catfile($REAL_WEB_ROOT, 'index.html');
+my $PAGE_404    = File::Spec->catfile(dirname(__FILE__), 'status', 'status.html');
 my $BUFFER_SIZE = 8192;
+my $MAX_REQUEST_SIZE = 16384;
+my $READ_TIMEOUT = 5;
+my $SEND_STALL_TIMEOUT = 30;
 
 my %MIME_TYPES = (
     html  => 'text/html',
@@ -50,9 +59,15 @@ my $cyan   = "\e[96m";
 my $magenta = "\e[95m";
 my $yellow = "\e[93m";
 
+my $SECURITY_HEADERS =
+    "X-Content-Type-Options: nosniff\r\n" .
+    "X-Frame-Options: DENY\r\n";
+
 # ======================
 # Socket setup
 # ======================
+$SIG{PIPE} = 'IGNORE';
+
 socket(my $server, PF_INET, SOCK_STREAM, getprotobyname('tcp')) or die "socket: $!";
 setsockopt($server, SOL_SOCKET, SO_REUSEADDR, 1) or die "setsockopt: $!";
 bind($server, sockaddr_in($PORT, inet_aton($HOST))) or die "bind: $!";
@@ -60,8 +75,9 @@ listen($server, SOMAXCONN) or die "listen: $!";
 
 print "#" x 80 . "\n";
 print "Server running at http://$HOST:$PORT/\n";
-print "Web root: $WEB_ROOT\n";
-print "Listening for input...\n";
+print "Web root: $REAL_WEB_ROOT\n";
+print "Listening for requests...\n";
+print "WARNING: For local development only!\n";
 print "#" x 80 . "\n" x 2;
 
 # ======================
@@ -71,63 +87,108 @@ print "#" x 80 . "\n" x 2;
 my $stream_counter = 0;
 my $last_time = time() - 5;
 
-my $power_saving_time = 1/1028;
-
 while (1) {
-
-    if ($power_saving_time > 0) {
-        sleep($power_saving_time);
-    }
-
     my $client;
     my $client_addr = accept($client, $server) or next;
-    
-    my $now_time = time();
-    my $delta_time = $now_time - $last_time;
 
-    if ($delta_time >= 5) {
-        my $stream_message = "STREAM ID: #$stream_counter" ;
-        $stream_counter++;
+    handle_client($client, $client_addr);
 
-        start_stream_banner($stream_message);
+    close $client if $client;
+}
+
+sub handle_client {
+    my ($client, $client_addr) = @_;
+
+    my $client_ip = 'unknown';
+
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+
+        my $now_time = time();
+        my $delta_time = $now_time - $last_time;
+        $last_time = $now_time;
+
+        if ($delta_time >= 5) {
+            my $stream_message = "STREAM ID: #$stream_counter" ;
+            $stream_counter++;
+            start_stream_banner($stream_message);
+        }
+
+        binmode($client);
+        setsockopt($client, SOL_SOCKET, SO_SNDTIMEO, pack('l!l!', $SEND_STALL_TIMEOUT, 0));
+        $client_ip = inet_ntoa((sockaddr_in($client_addr))[1]) // 'unknown';
+
+        my $request = '';
+        my $total_read = 0;
+
+        alarm($READ_TIMEOUT);
+
+        while ($total_read < $MAX_REQUEST_SIZE) {
+            my $buffer = '';
+            my $bytes = sysread($client, $buffer, $BUFFER_SIZE);
+
+            unless (defined $bytes) {
+                last;
+            }
+
+            last if $bytes == 0;
+
+            $request .= $buffer;
+            $total_read += $bytes;
+
+            last if $request =~ /\r\n\r\n|\n\n/;
+        }
+
+        alarm(0);
+
+        if ($total_read >= $MAX_REQUEST_SIZE && !($request =~ /\r\n\r\n|\n\n/)) {
+            send_response($client, 413, "Request Entity Too Large", "text/plain", "Request too large", $client_ip, undef);
+            return;
+        }
+
+        if (!$total_read) {
+            return;
+        }
+
+        my ($method, $path) = parse_request($request);
+
+        if (!$method || !$path) {
+            send_response($client, 400, "Bad Request", "text/plain", "Invalid request", $client_ip, undef);
+            return;
+        }
+
+        if ($method ne 'GET') {
+            send_response($client, 405, "Method Not Allowed", "text/plain", "Method not allowed", $client_ip, undef);
+            return;
+        }
+
+        if ($path =~ /[^\x20-\x7E]/) {
+            send_response($client, 400, "Bad Request", "text/plain", "Invalid characters in path", $client_ip, undef);
+            return;
+        }
+
+        my $file_path = sanitize_path($path);
+        if (!$file_path) {
+            send_response($client, 403, "Forbidden", "text/plain", "Access denied", $client_ip, $path);
+            return;
+        }
+
+        serve_file($client, $file_path, $client_ip);
+        return;
+    };
+
+    my $error = $@;
+    alarm(0);
+
+    return unless $error;
+
+    if ($error =~ /timeout/) {
+        print "Request timeout from client\n";
+        send_response($client, 408, "Request Timeout", "text/plain", "Timeout", 'unknown', undef);
     }
-
-    binmode($client);
-
-    my $client_ip = inet_ntoa((sockaddr_in($client_addr))[1]) // 'unknown';
-
-    my $request = '';
-    my $bytes_read = sysread($client, $request, $BUFFER_SIZE);
-    if (!$bytes_read) {
-        close $client;
-        next;
+    else {
+        send_response($client, 500, "Internal Server Error", "text/plain", "Internal error", $client_ip, undef);
     }
-
-    my ($method, $path) = parse_request($request);
-
-    if (!$method || !$path) {
-        send_response($client, 400, "Bad Request", "text/plain", "Invalid request", $client_ip, $path);
-        close $client;
-        next;
-    }
-
-    if ($method ne 'GET') {
-        send_response($client, 405, "Method Not Allowed", "text/plain", "Method not allowed", $client_ip, $path);
-        close $client;
-        next;
-    }
-
-    my $file_path = sanitize_path($path);
-    if (!$file_path) {
-        send_response($client, 400, "Bad Request", "text/plain", "Invalid path", $client_ip, $path);
-        close $client;
-        next;
-    }
-
-    serve_file($client, $file_path, $client_ip);
-    close $client;
-
-    $last_time = $now_time;
 }
 
 # ======================
@@ -136,7 +197,9 @@ while (1) {
 
 sub start_stream_banner {
     my ($stream_message) = @_;
-    
+
+    $stream_message =~ s/\e//g;
+
     my $line = '=' x 80;
     my $space = ' ' x 80;
 
@@ -150,14 +213,20 @@ sub start_stream_banner {
     print "\n";
 }
 
-
 # ======================
 # Request parsing
 # ======================
 sub parse_request {
     my ($request) = @_;
-    if ($request =~ /^([A-Z]+)\s+([^\s]+)\s+HTTP\/1\.[01]/) {
-        return ($1, $2);
+
+    if ($request =~ /^([A-Z]+)\s+([^\s]+)\s+HTTP\/1\.[01]\r?\n/) {
+        my ($method, $path) = ($1, $2);
+
+        $path = uri_unescape($path);
+
+        return undef if $path =~ /\0/;
+
+        return ($method, $path);
     }
     return;
 }
@@ -165,42 +234,99 @@ sub parse_request {
 # ======================
 # Path sanitization
 # ======================
+sub path_within_root {
+    my ($path) = @_;
+
+    return 0 unless defined $path;
+    return 1 if $path eq $REAL_WEB_ROOT;
+    return index($path, $ROOT_PREFIX) == 0 ? 1 : 0;
+}
+
 sub sanitize_path {
     my ($path) = @_;
 
     $path = '/' if !defined $path || $path eq '';
+
     $path =~ s/[?#].*$//;
+
     $path =~ s{\\}{/}g;
     $path =~ s{/+}{/}g;
 
-    return undef if $path =~ /\.\./ || $path =~ /\0/;
+    return undef if $path =~ /\.\./;
 
-    $path =~ s{^/}{};
+    my $full_path = File::Spec->catfile($REAL_WEB_ROOT, $path);
 
-    if ($path eq '') {
+    my $real_path = eval { realpath($full_path) };
+
+    if (!$real_path) {
+        my @components = split('/', $path);
+        my $depth = 0;
+        for my $comp (@components) {
+            if ($comp eq '..') {
+                $depth--;
+                return undef if $depth < 0;
+            } elsif ($comp ne '.' && $comp ne '') {
+                $depth++;
+            }
+        }
+
+        $real_path = $full_path;
+    }
+
+    return undef unless path_within_root($real_path);
+
+    my $relative_path = substr($real_path, length($REAL_WEB_ROOT));
+    return undef if $relative_path =~ m{/\.} || $relative_path =~ /^\./;
+
+    if (-d $real_path) {
         return $INDEX_FILE;
     }
 
-    return File::Spec->catfile($WEB_ROOT, $path);
+    return $real_path;
 }
 
 # ======================
 # File serving
 # ======================
+sub write_all {
+    my ($client, $data) = @_;
+
+    my $length = length($data);
+    my $offset = 0;
+
+    while ($offset < $length) {
+        my $written = syswrite($client, $data, $length - $offset, $offset);
+
+        unless (defined $written) {
+            next if $! == EINTR;
+            return 0;
+        }
+
+        last if $written == 0;
+        $offset += $written;
+    }
+
+    return $offset == $length ? 1 : 0;
+}
+
 sub serve_file {
     my ($client, $file_path, $client_ip) = @_;
 
-    if (-d $file_path) {
-        $file_path = $INDEX_FILE;
-    }
+    return serve_403($client, $client_ip, $file_path) unless path_within_root($file_path);
 
-    my ($ext) = $file_path =~ /\.([^.]+)$/;
-    my $mime_type = $MIME_TYPES{lc($ext // '')} || 'application/octet-stream';
-
-    unless (-f $file_path && -r $file_path) {
+    unless (-f $file_path && -r _) {
         serve_404($client, $client_ip, $file_path);
         return;
     }
+
+    serve_static($client, $file_path, $client_ip, 200, "OK");
+}
+
+sub serve_static {
+    my ($client, $file_path, $client_ip, $code, $status) = @_;
+
+    my ($ext) = $file_path =~ /\.([^.]+)$/;
+    my $mime_type = $MIME_TYPES{lc($ext // '')} || 'application/octet-stream';
 
     open(my $fh, '<', $file_path) or do {
         send_response($client, 500, "Internal Server Error", "text/plain", "Cannot open file", $client_ip, $file_path);
@@ -208,13 +334,15 @@ sub serve_file {
     };
     binmode($fh);
 
-    my $file_size = -s $file_path;
+    my $file_size = -s $fh;
+    my $cache_control = $code == 200 ? "public, max-age=3600" : "no-store";
 
     my $headers =
-        "HTTP/1.1 200 OK\r\n" .
+        "HTTP/1.1 $code $status\r\n" .
         "Content-Type: $mime_type\r\n" .
         "Content-Length: $file_size\r\n" .
-        "Cache-Control: public, max-age=3600\r\n" .
+        "Cache-Control: $cache_control\r\n" .
+        $SECURITY_HEADERS .
         "Connection: close\r\n\r\n";
 
     log_packet(
@@ -227,13 +355,16 @@ sub serve_file {
         content    => $headers
     );
 
-    print $client $headers;
+    unless (write_all($client, $headers)) {
+        close $fh;
+        return;
+    }
 
     my $sent = 0;
     my $packet_num = 1;
 
     while (my $read = sysread($fh, my $buffer, $BUFFER_SIZE)) {
-        print $client $buffer;
+        last unless write_all($client, $buffer);
         $sent += $read;
 
         log_packet(
@@ -252,18 +383,27 @@ sub serve_file {
 }
 
 # ======================
+# 403 handling
+# ======================
+sub serve_403 {
+    my ($client, $client_ip, $requested_path) = @_;
+    send_response($client, 403, "Forbidden", "text/plain", "Access denied", $client_ip, $requested_path);
+}
+
+# ======================
 # 404 handling
 # ======================
 sub serve_404 {
     my ($client, $client_ip, $requested_path) = @_;
 
-    if ($requested_path =~ /\.html?$/i && -f $PAGE_404 && -r $PAGE_404) {
-        serve_file($client, $PAGE_404, $client_ip);
+    my $real_404 = eval { realpath($PAGE_404) };
+    if ($real_404 && -f $real_404 && -r _) {
+        serve_static($client, $real_404, $client_ip, 404, "Not Found");
+        return;
     }
 
     send_response($client, 404, "Not Found", "text/plain", "File not found", $client_ip, $requested_path);
 }
-
 
 # ======================
 # Generic responses
@@ -275,6 +415,7 @@ sub send_response {
         "HTTP/1.1 $code $status\r\n" .
         "Content-Type: $type\r\n" .
         "Content-Length: " . length($body) . "\r\n" .
+        $SECURITY_HEADERS .
         "Connection: close\r\n\r\n" .
         $body;
 
@@ -288,7 +429,7 @@ sub send_response {
         content    => $response
     );
 
-    print $client $response;
+    syswrite($client, $response);
 }
 
 # ======================
@@ -298,36 +439,43 @@ sub log_packet {
     my %params = @_;
     my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
 
+    my $safe_file_path = $params{file_path} // '';
+    $safe_file_path =~ s/\e//g;
+
     my $separator    = '=' x 80;
     my $subseparator = '-' x 80;
 
-    print "\n\033[1;36m$separator\033[0m\n";
-    print "\033[1;33m| PACKET DETAILS (\033[1;37m$params{type}\033[1;33m) at \033[1;35m$timestamp\033[0m\n";
-    print "\033[1;36m$subseparator\033[0m\n";
+    my $output = '';
 
-    print "\033[1;32m| Client:\033[0m     \033[1;37m$params{client_ip}\033[0m\n";
+    $output .= "\n\033[1;36m$separator\033[0m\n";
+    $output .= "\033[1;33m| PACKET DETAILS (\033[1;37m$params{type}\033[1;33m) at \033[1;35m$timestamp\033[0m\n";
+    $output .= "\033[1;36m$subseparator\033[0m\n";
 
-    print "\033[1;32m| File:\033[0m       \033[1;37m$params{file_path}\033[0m\n"
+    $output .= "\033[1;32m| Client:\033[0m     \033[1;37m$params{client_ip}\033[0m\n";
+
+    $output .= "\033[1;32m| File:\033[0m       \033[1;37m$safe_file_path\033[0m\n"
         if exists $params{file_path};
 
-    print "\033[1;32m| Status:\033[0m     \033[1;37m$params{code} $params{status}\033[0m\n"
+    $output .= "\033[1;32m| Status:\033[0m     \033[1;37m$params{code} $params{status}\033[0m\n"
         if exists $params{code};
 
-    print "\033[1;32m| MIME Type:\033[0m  \033[1;37m$params{mime_type}\033[0m\n"
+    $output .= "\033[1;32m| MIME Type:\033[0m  \033[1;37m$params{mime_type}\033[0m\n"
         if exists $params{mime_type};
 
-    print "\033[1;32m| Size:\033[0m       \033[1;37m$params{size} bytes\033[0m\n";
+    $output .= "\033[1;32m| Size:\033[0m       \033[1;37m$params{size} bytes\033[0m\n";
 
-    print "\033[1;32m| File Size:\033[0m  \033[1;37m$params{file_size} bytes\033[0m\n"
+    $output .= "\033[1;32m| File Size:\033[0m  \033[1;37m$params{file_size} bytes\033[0m\n"
         if exists $params{file_size};
 
-    print "\033[1;32m| Packet #:\033[0m   \033[1;37m$params{packet_num}\033[0m\n"
+    $output .= "\033[1;32m| Packet #:\033[0m   \033[1;37m$params{packet_num}\033[0m\n"
         if exists $params{packet_num};
 
-    print "\033[1;32m| Progress:\033[0m   \033[1;37m$params{progress}%\033[0m\n"
+    $output .= "\033[1;32m| Progress:\033[0m   \033[1;37m$params{progress}%\033[0m\n"
         if exists $params{progress};
 
-    print "\033[1;36m$separator\033[0m\n\n";
+    $output .= "\033[1;36m$separator\033[0m\n\n";
+
+    print $output;
 }
 
 END {
