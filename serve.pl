@@ -10,6 +10,7 @@ use Cwd 'realpath';
 use URI::Escape;
 use File::Find;
 use Digest::MD5 qw(md5_hex);
+use Storable qw(nstore retrieve);
 
 # ======================
 # Configuration
@@ -26,6 +27,9 @@ my $ROOT_PREFIX = $REAL_WEB_ROOT =~ m{/$} ? $REAL_WEB_ROOT : $REAL_WEB_ROOT . '/
 my $INDEX_FILE  = File::Spec->catfile($REAL_WEB_ROOT, 'index.html');
 my $PAGE_404    = File::Spec->catfile(dirname(__FILE__), 'status', 'status.html');
 my $REAL_PAGE_404 = eval { realpath($PAGE_404) };
+
+my $HISTORY_DIR_NAME = '.overport-history';
+my $HISTORY_DIR      = File::Spec->catdir(dirname(__FILE__), $HISTORY_DIR_NAME);
 my $BUFFER_SIZE = 8192;
 my $MAX_REQUEST_SIZE = 16384;
 my $READ_TIMEOUT = 5;
@@ -114,10 +118,19 @@ my $last_poll_epoch;
 my $poll_count    = 0;
 my $request_count = 0;
 
+my $stream_counter = 0;
+my $last_time      = time() - 5;
+my $star_seed      = int(rand(0x7FFFFFFF));
+my $history_ready  = 0;
+
 my @log_lines;
 my $scroll_offset  = 0;
 my $MAX_LOG_LINES  = 2000;
 my $termios_orig;
+my $tui_active     = 0;
+
+my $confirm_open   = 0;
+my $confirm_choice = 0;
 
 # Star colors are deliberately kept off the TUI color scheme (bright magenta/
 # cyan/white/green/yellow/red/grey): blues, indigo, teal, violet, and orange
@@ -163,6 +176,7 @@ setsockopt($server, SOL_SOCKET, SO_REUSEADDR, 1) or die "setsockopt: $!";
 bind($server, sockaddr_in($PORT, inet_aton($HOST))) or die "bind: $!";
 listen($server, SOMAXCONN) or die "listen: $!";
 
+init_history();
 tui_init();
 
 push_log_records(
@@ -178,9 +192,6 @@ push_log_records(
 # ======================
 # Main loop
 # ======================
-
-my $stream_counter = 0;
-my $last_time = time() - 5;
 
 my $rin = '';
 vec($rin, fileno($server), 1) = 1;
@@ -305,6 +316,93 @@ sub handle_client {
 }
 
 # ======================
+# History persistence
+# ======================
+
+sub history_file {
+    return File::Spec->catfile($HISTORY_DIR, md5_hex($REAL_WEB_ROOT) . '.hist');
+}
+
+sub init_history {
+    mkdir $HISTORY_DIR unless -d $HISTORY_DIR;
+    update_gitignore();
+    load_history();
+    $history_ready = 1;
+}
+
+sub update_gitignore {
+    my $gitignore = File::Spec->catfile(dirname(__FILE__), '.gitignore');
+    return unless -f $gitignore;
+
+    open(my $fh, '<', $gitignore) or return;
+    my $content = do { local $/; <$fh> };
+    close $fh;
+
+    return if $content =~ m{^\Q$HISTORY_DIR_NAME\E/?\s*$}m;
+
+    open($fh, '>>', $gitignore) or return;
+    print $fh "\n" if length($content) && $content !~ /\n$/;
+    print $fh "$HISTORY_DIR_NAME/\n";
+    close $fh;
+}
+
+sub load_history {
+    my $file = history_file();
+    return unless -f $file;
+
+    my $data = eval { retrieve($file) };
+    return unless $data && ref $data eq 'HASH';
+
+    @log_lines       = @{ $data->{log_lines} // [] };
+    $stream_counter  = $data->{stream_counter}  // 0;
+    $last_time       = $data->{last_time}       // (time() - 5);
+    $last_hot_reload = $data->{last_hot_reload};
+    $last_poll_epoch = $data->{last_poll_epoch};
+    $poll_count      = $data->{poll_count}      // 0;
+    $request_count   = $data->{request_count}   // 0;
+    $star_seed       = $data->{star_seed} if defined $data->{star_seed};
+
+    if (@log_lines > $MAX_LOG_LINES) {
+        splice(@log_lines, 0, @log_lines - $MAX_LOG_LINES);
+    }
+}
+
+sub save_history {
+    return unless $history_ready && defined $REAL_WEB_ROOT;
+
+    mkdir $HISTORY_DIR unless -d $HISTORY_DIR;
+
+    eval {
+        nstore({
+            log_lines       => [@log_lines],
+            stream_counter  => $stream_counter,
+            last_time       => $last_time,
+            last_hot_reload => $last_hot_reload,
+            last_poll_epoch => $last_poll_epoch,
+            poll_count      => $poll_count,
+            request_count   => $request_count,
+            star_seed       => $star_seed,
+        }, history_file());
+    };
+}
+
+sub clear_history {
+    @log_lines       = ();
+    $scroll_offset   = 0;
+    $stream_counter  = 0;
+    $last_time       = time() - 5;
+    $last_hot_reload = undef;
+    $last_poll_epoch = undef;
+    $poll_count      = 0;
+    $request_count   = 0;
+    $star_seed       = int(rand(0x7FFFFFFF));
+
+    unlink history_file();
+
+    push_log_records(make_line("${WARN}History cleared. Stream numbering restarts at #0.$RESET", 'center'));
+}
+
+# ======================
 # Terminal utility
 # ======================
 
@@ -346,6 +444,7 @@ sub tui_init {
 
     $SIG{INT} = $SIG{TERM} = sub { exit 0 };
 
+    $tui_active = 1;
     print "\e[?1049h\e[?25l\e[?7l\e[2J";
     redraw_screen();
 }
@@ -379,7 +478,7 @@ sub star_field_row {
     for my $layer (0 .. $#STAR_LAYERS) {
         my $l = $STAR_LAYERS[$layer];
         my $world = $row - int($scroll_offset * $l->{speed});
-        my $hash = md5_hex("stars:$layer:$world");
+        my $hash = md5_hex("stars:$star_seed:$layer:$world");
 
         for my $i (0 .. 2) {
             my $v = hex(substr($hash, $i * 8, 8));
@@ -425,6 +524,7 @@ sub redraw_screen {
     print $out;
 
     draw_status_bar();
+    draw_confirm_box();
 }
 
 sub strip_len {
@@ -471,7 +571,7 @@ sub draw_status_bar {
     my $url    = "\e[4m${VALUE}http://$HOST:$PORT/$RESET";
     my $counts = "${MUTED}polls $poll_count | reqs $request_count$RESET";
 
-    my $keys = "${MUTED}Up/Down PgUp/PgDn scroll | Home top | End follow | q quit$RESET";
+    my $keys = "${MUTED}Up/Down PgUp/PgDn scroll | Home top | End follow | c clear | q quit$RESET";
     my $mode = $scroll_offset > 0
         ? "$WARN^ SCROLLED +$scroll_offset$RESET"
         : "$GOOD>> FOLLOWING$RESET";
@@ -493,10 +593,90 @@ sub draw_status_bar {
     print $out;
 }
 
+sub box_row {
+    my ($content, $inner) = @_;
+
+    my $vis  = strip_len($content);
+    my $padl = int(($inner - $vis) / 2);
+    $padl = 0 if $padl < 0;
+    my $padr = $inner - $vis - $padl;
+    $padr = 0 if $padr < 0;
+
+    return "$WARN|$RESET" . (' ' x $padl) . $content . (' ' x $padr) . "$WARN|$RESET";
+}
+
+sub draw_confirm_box {
+    return unless $IS_TTY && $confirm_open;
+
+    my $w = 50;
+    $w = $TERM_COLS if $w > $TERM_COLS;
+    my $inner = $w - 2;
+
+    my $left = int(($TERM_COLS - $w) / 2) + 1;
+    $left = 1 if $left < 1;
+
+    my $yes = $confirm_choice == 1 ? "$WARN\e[7m [ Yes ] $RESET" : "$MUTED [ Yes ] $RESET";
+    my $no  = $confirm_choice == 0 ? "$GOOD\e[7m [ No ] $RESET"  : "$MUTED [ No ] $RESET";
+
+    my $border = $WARN . '+' . ('-' x $inner) . '+' . $RESET;
+    my @lines = (
+        $border,
+        box_row('', $inner),
+        box_row("${VALUE}Clear saved history for this web root?$RESET", $inner),
+        box_row("${MUTED}Stream numbering will restart at #0.$RESET", $inner),
+        box_row('', $inner),
+        box_row($yes . '    ' . $no, $inner),
+        box_row('', $inner),
+        $border,
+    );
+
+    my $top = int((log_height() - scalar @lines) / 2) + 1;
+    $top = 1 if $top < 1;
+
+    my $out = '';
+    for my $i (0 .. $#lines) {
+        my $row = $top + $i;
+        $out .= "\e[${row};${left}H\e[0m" . $lines[$i];
+    }
+    print $out;
+}
+
+sub handle_confirm_keys {
+    my ($buf) = @_;
+
+    while (length $buf) {
+        if ($buf =~ s/^(?:\e\[[ABCD]|\eO[ABCD])//) {
+            $confirm_choice = 1 - $confirm_choice;
+            draw_confirm_box();
+        }
+        elsif ($buf =~ s/^[\r\n]//) {
+            my $confirmed = $confirm_choice == 1;
+            $confirm_open = 0;
+            if ($confirmed) {
+                clear_history();
+            }
+            else {
+                redraw_screen();
+            }
+            return;
+        }
+        elsif ($buf =~ s/^\e//) {
+            $confirm_open = 0;
+            redraw_screen();
+            return;
+        }
+        else {
+            substr($buf, 0, 1, '');
+        }
+    }
+}
+
 sub handle_keys {
     my $buf = '';
     sysread(STDIN, $buf, 256);
     return unless length $buf;
+
+    return handle_confirm_keys($buf) if $confirm_open;
 
     my $page = log_height() - 1;
     $page = 1 if $page < 1;
@@ -509,6 +689,12 @@ sub handle_keys {
         elsif ($buf =~ s/^(?:\e\[B|\eOB)//)      { $scroll_offset -= 1; }
         elsif ($buf =~ s/^(?:\e\[H|\e\[1~|\eOH)//) { $scroll_offset = scalar @log_lines; }
         elsif ($buf =~ s/^(?:\e\[F|\e\[4~|\eOF)//) { $scroll_offset = 0; }
+        elsif ($buf =~ s/^c//) {
+            $confirm_open   = 1;
+            $confirm_choice = 0;
+            redraw_screen();
+            return;
+        }
         elsif ($buf =~ s/^q//)                   { exit 0; }
         else                                     { substr($buf, 0, 1, ''); }
     }
@@ -520,6 +706,13 @@ sub handle_keys {
 sub push_log_records {
     my (@records) = @_;
 
+    push @log_lines, @records;
+    $scroll_offset += @records if $scroll_offset > 0;
+
+    if (@log_lines > $MAX_LOG_LINES) {
+        splice(@log_lines, 0, @log_lines - $MAX_LOG_LINES);
+    }
+
     unless ($IS_TTY) {
         for my $rec (@records) {
             print $rec->{rule}
@@ -527,13 +720,6 @@ sub push_log_records {
                 : $rec->{text} . "\n";
         }
         return;
-    }
-
-    push @log_lines, @records;
-    $scroll_offset += @records if $scroll_offset > 0;
-
-    if (@log_lines > $MAX_LOG_LINES) {
-        splice(@log_lines, 0, @log_lines - $MAX_LOG_LINES);
     }
 
     clamp_scroll();
@@ -918,7 +1104,8 @@ sub log_packet {
 }
 
 END {
-    if ($IS_TTY) {
+    save_history();
+    if ($IS_TTY && $tui_active) {
         print "\e[?7h\e[?25h\e[0m\e[?1049l";
         $termios_orig->setattr(fileno(STDIN), TCSANOW) if $termios_orig;
     }
