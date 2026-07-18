@@ -903,7 +903,13 @@ sub init_history {
 
 sub update_gitignore {
     my $gitignore = File::Spec->catfile(dirname(__FILE__), '.gitignore');
-    return unless -f $gitignore;
+
+    unless (-f $gitignore) {
+        open(my $fh, '>', $gitignore) or return;
+        print $fh "$HISTORY_DIR_NAME/\n";
+        close $fh;
+        return;
+    }
 
     open(my $fh, '<', $gitignore) or return;
     my $content = do { local $/; <$fh> };
