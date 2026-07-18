@@ -4,9 +4,10 @@ use warnings;
 use Socket;
 use File::Basename;
 use File::Spec;
+use File::Path qw(make_path);
 use POSIX qw(strftime :termios_h);
 use Errno qw(EINTR);
-use Cwd 'realpath';
+use Cwd qw(realpath getcwd);
 use URI::Escape;
 use File::Find;
 use Digest::MD5 qw(md5_hex);
@@ -18,7 +19,10 @@ use Time::HiRes ();
 # ======================
 my $PORT        = 9001;
 my $HOST        = '127.0.0.1';
-my $WEB_ROOT    = $ARGV[0] // File::Spec->catdir(dirname(__FILE__), './src' );
+
+my $SCRIPT_DIR  = dirname(realpath($0));
+
+my $WEB_ROOT    = $ARGV[0] // File::Spec->catdir(getcwd(), 'src');
 
 my $REAL_WEB_ROOT = realpath($WEB_ROOT);
 die "Invalid web root: $WEB_ROOT\n" unless defined $REAL_WEB_ROOT && -d $REAL_WEB_ROOT;
@@ -26,11 +30,13 @@ die "Invalid web root: $WEB_ROOT\n" unless defined $REAL_WEB_ROOT && -d $REAL_WE
 my $ROOT_PREFIX = $REAL_WEB_ROOT =~ m{/$} ? $REAL_WEB_ROOT : $REAL_WEB_ROOT . '/';
 
 my $INDEX_FILE  = File::Spec->catfile($REAL_WEB_ROOT, 'index.html');
-my $PAGE_404    = File::Spec->catfile(dirname(__FILE__), 'status', 'status.html');
+my $PAGE_404    = File::Spec->catfile($SCRIPT_DIR, 'status', 'status.html');
 my $REAL_PAGE_404 = eval { realpath($PAGE_404) };
 
-my $HISTORY_DIR_NAME = '.overport-history';
-my $HISTORY_DIR      = File::Spec->catdir(dirname(__FILE__), $HISTORY_DIR_NAME);
+my $STATE_HOME = (defined $ENV{XDG_STATE_HOME} && length $ENV{XDG_STATE_HOME})
+    ? $ENV{XDG_STATE_HOME}
+    : File::Spec->catdir($ENV{HOME} // (getpwuid($<))[7], '.local', 'state');
+my $HISTORY_DIR      = File::Spec->catdir($STATE_HOME, 'overport');
 my $SETTINGS_FILE    = File::Spec->catfile($HISTORY_DIR, 'settings.pref');
 my $BUFFER_SIZE = 8192;
 my $MAX_REQUEST_SIZE = 16384;
@@ -895,32 +901,9 @@ sub history_file {
 }
 
 sub init_history {
-    mkdir $HISTORY_DIR unless -d $HISTORY_DIR;
-    update_gitignore();
+    make_path($HISTORY_DIR) unless -d $HISTORY_DIR;
     load_history();
     $history_ready = 1;
-}
-
-sub update_gitignore {
-    my $gitignore = File::Spec->catfile(dirname(__FILE__), '.gitignore');
-
-    unless (-f $gitignore) {
-        open(my $fh, '>', $gitignore) or return;
-        print $fh "$HISTORY_DIR_NAME/\n";
-        close $fh;
-        return;
-    }
-
-    open(my $fh, '<', $gitignore) or return;
-    my $content = do { local $/; <$fh> };
-    close $fh;
-
-    return if $content =~ m{^\Q$HISTORY_DIR_NAME\E/?\s*$}m;
-
-    open($fh, '>>', $gitignore) or return;
-    print $fh "\n" if length($content) && $content !~ /\n$/;
-    print $fh "$HISTORY_DIR_NAME/\n";
-    close $fh;
 }
 
 sub load_history {
@@ -948,7 +931,7 @@ sub load_history {
 sub save_history {
     return unless $history_ready && defined $REAL_WEB_ROOT;
 
-    mkdir $HISTORY_DIR unless -d $HISTORY_DIR;
+    make_path($HISTORY_DIR) unless -d $HISTORY_DIR;
 
     eval {
         nstore({
@@ -1011,7 +994,7 @@ sub load_settings {
 }
 
 sub save_settings {
-    mkdir $HISTORY_DIR unless -d $HISTORY_DIR;
+    make_path($HISTORY_DIR) unless -d $HISTORY_DIR;
 
     eval {
         nstore({
