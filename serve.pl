@@ -232,7 +232,7 @@ my %TONE_SPEC = (
         { freq => 520, freq_end => 560, duration => 0.10, wave => 'sine', volume => 0.18 },
     ],
     packet => [
-        { freq => 300, freq_end => 240, duration => 0.035, wave => 'saw', volume => 0.13 },
+        { freq => 480, duration => 0.06, wave => 'sine', volume => 0.13 },
     ],
     stream => [
         { freq => 260, duration => 0.08, wave => 'sine', vibrato_hz => 8, vibrato_depth => 0.02, volume => 0.16, gap => 0.025 },
