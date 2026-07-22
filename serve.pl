@@ -11,6 +11,8 @@ use Cwd qw(realpath getcwd);
 use URI::Escape;
 use File::Find;
 use Digest::MD5 qw(md5_hex);
+use Digest::SHA qw(sha1);
+use MIME::Base64 qw(encode_base64);
 use Storable qw(nstore retrieve);
 use Time::HiRes ();
 
@@ -46,29 +48,18 @@ my $SEND_STALL_TIMEOUT = 30;
 my $HOT_RELOAD         = 1;
 my $HOT_RELOAD_PATH    = '/__hotreload';
 my $HOT_RELOAD_POLL_MS = 1000;
+my $HOT_RELOAD_MODE    = 'poll';          # 'poll' (client polls) or 'push' (server pushes over a WebSocket)
 
-my $HOT_RELOAD_SCRIPT = <<"END_SCRIPT";
-<script>
-(function () {
-    var current = null;
-    function poll() {
-        fetch('$HOT_RELOAD_PATH', { cache: 'no-store' })
-            .then(function (res) { return res.text(); })
-            .then(function (sig) {
-                if (current === null) {
-                    current = sig;
-                } else if (sig !== current) {
-                    location.reload();
-                    return;
-                }
-                setTimeout(poll, $HOT_RELOAD_POLL_MS);
-            })
-            .catch(function () { setTimeout(poll, $HOT_RELOAD_POLL_MS); });
-    }
-    poll();
-})();
-</script>
-END_SCRIPT
+# ---- WebSocket push mode state ----
+my $WS_GUID            = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';   # RFC 6455 handshake magic
+my $WS_SCAN_INTERVAL   = 1;               # seconds between web-root scans while clients are connected
+
+my @ws_clients;                           # live WebSocket connections: { fh, ip, buf }
+my $last_ws_signature;                    # web-root signature the monitor last observed
+my $last_ws_scan_at    = 0;
+my $ws_reload_count    = 0;
+my $last_ws_reload;                       # human-readable timestamp of the last pushed reload
+my $last_ws_reload_epoch;
 
 my %MIME_TYPES = (
     html  => 'text/html',
@@ -184,6 +175,7 @@ my $settings_open    = 0;
 my $settings_index   = 0;
 my $settings_editing = 0;
 my $settings_edit_buffer = '';
+my $settings_flash   = '';
 
 my $MAIN_PID = $$;
 
@@ -766,11 +758,17 @@ while (1) {
     vec($rin, fileno($server), 1) = 1;
     vec($rin, fileno(STDIN), 1) = 1 if $IS_TTY;
     vec($rin, fileno($stress_test_read_fh), 1) = 1 if $stress_test_running && $stress_test_read_fh;
+    for my $c (@ws_clients) {
+        my $fn = fileno($c->{fh});
+        vec($rin, $fn, 1) = 1 if defined $fn;
+    }
 
     my $timeout = $redraw_pending ? redraw_interval() : 1;
     my $rout = $rin;
     my $ready = select($rout, undef, undef, $timeout);
     next if !defined $ready || $ready < 0;
+
+    ws_check_filesystem();
 
     if ($ready == 0) {
         cleanup_old_logs();
@@ -784,13 +782,22 @@ while (1) {
         finish_stress_test();
     }
 
+    if (@ws_clients) {
+        my @readable = @ws_clients;   # snapshot: ws_handle_readable may prune @ws_clients
+        for my $c (@readable) {
+            my $fn = fileno($c->{fh});
+            next unless defined $fn && vec($rout, $fn, 1);
+            ws_handle_readable($c);
+        }
+    }
+
     if (vec($rout, fileno($server), 1)) {
         my $client;
         my $client_addr = accept($client, $server) or next;
 
-        handle_client($client, $client_addr);
+        my $keep = handle_client($client, $client_addr);
 
-        close $client if $client;
+        close $client if $client && !$keep;
     }
 
     request_redraw() if $redraw_pending;
@@ -800,6 +807,7 @@ sub handle_client {
     my ($client, $client_addr) = @_;
 
     my $client_ip = 'unknown';
+    my $keep_open = 0;
 
     eval {
         local $SIG{ALRM} = sub { die "timeout\n" };
@@ -858,6 +866,23 @@ sub handle_client {
         }
 
         if ($HOT_RELOAD && $path =~ m{^\Q$HOT_RELOAD_PATH\E(?:[?#]|$)}) {
+            my $headers = parse_headers($request);
+
+            # WebSocket upgrade (push mode): keep the socket open and register it.
+            if (   lc($headers->{connection} // '') =~ /\bupgrade\b/
+                && lc($headers->{upgrade}    // '') eq 'websocket'
+                && defined $headers->{'sec-websocket-key'}) {
+
+                if (ws_handshake($client, $headers->{'sec-websocket-key'})) {
+                    push @ws_clients, { fh => $client, ip => $client_ip, buf => '' };
+                    $last_ws_signature = web_root_signature() unless defined $last_ws_signature;
+                    $keep_open = 1;
+                    log_ws_connect($client_ip);
+                }
+                return;
+            }
+
+            # Poll mode: report the current web-root signature.
             $last_hot_reload = strftime("%Y-%m-%d %H:%M:%S", localtime);
             $last_poll_epoch = time();
             $poll_count++;
@@ -881,7 +906,7 @@ sub handle_client {
     my $error = $@;
     alarm(0);
 
-    return unless $error;
+    return $keep_open unless $error;
 
     if ($error =~ /timeout/) {
         log_output("${WARN}Request timeout from client$RESET\n");
@@ -890,6 +915,8 @@ sub handle_client {
     else {
         send_response($client, 500, "Internal Server Error", "text/plain", "Internal error", $client_ip, undef);
     }
+
+    return 0;
 }
 
 # ======================
@@ -977,6 +1004,7 @@ sub load_settings {
     return unless $data && ref $data eq 'HASH';
 
     $HOT_RELOAD             = $data->{hot_reload}            if defined $data->{hot_reload};
+    $HOT_RELOAD_MODE        = ($data->{hot_reload_mode} eq 'push' ? 'push' : 'poll') if defined $data->{hot_reload_mode};
     $power_monitor_enabled  = $data->{power_monitor_enabled} if defined $data->{power_monitor_enabled};
     $POWER_SAMPLE_INTERVAL  = $data->{power_sample_interval} if defined $data->{power_sample_interval};
     $XFER_WINDOW_SECS       = $data->{xfer_window_secs}      if defined $data->{xfer_window_secs};
@@ -999,6 +1027,7 @@ sub save_settings {
     eval {
         nstore({
             hot_reload             => $HOT_RELOAD,
+            hot_reload_mode        => $HOT_RELOAD_MODE,
             power_monitor_enabled  => $power_monitor_enabled,
             power_sample_interval  => $POWER_SAMPLE_INTERVAL,
             xfer_window_secs       => $XFER_WINDOW_SECS,
@@ -1202,6 +1231,13 @@ sub bar_content {
          . $right . ' ' . $FRAME . '|' . $RESET;
 }
 
+sub relative_age {
+    my ($age) = @_;
+    return $age < 2  ? 'just now'
+         : $age < 60 ? "${age}s ago"
+         :             sprintf('%dm %ds ago', $age / 60, $age % 60);
+}
+
 sub draw_status_bar {
     return '' unless $IS_TTY;
 
@@ -1210,15 +1246,27 @@ sub draw_status_bar {
     my $inner = $TERM_COLS - 2;
 
     my $poll;
-    if (defined $last_poll_epoch) {
+    if ($HOT_RELOAD_MODE eq 'push') {
+        my $n       = scalar @ws_clients;
+        my $dot     = $n > 0 ? "$GOOD*$RESET" : "${MUTED}o$RESET";
+        my $clients = "$VALUE$n$RESET ${MUTED}client" . ($n == 1 ? '' : 's') . "$RESET";
+        if (defined $last_ws_reload_epoch) {
+            my $age_str = relative_age(time() - $last_ws_reload_epoch);
+            $poll = "$dot ${LABEL}Hot reload$RESET ${MUTED}(WS)$RESET $clients "
+                  . "${MUTED}- last push$RESET $VALUE$last_ws_reload$RESET "
+                  . "$MUTED($age_str)$RESET";
+        }
+        else {
+            $poll = "$dot ${LABEL}Hot reload$RESET ${MUTED}(WS)$RESET $clients "
+                  . "${MUTED}- watching for changes$RESET";
+        }
+    }
+    elsif (defined $last_poll_epoch) {
         my $age = time() - $last_poll_epoch;
-        my $age_str = $age < 2  ? 'just now'
-                    : $age < 60 ? "${age}s ago"
-                    : sprintf('%dm %ds ago', $age / 60, $age % 60);
         my $dot_color = $age <= 3 ? $GOOD : $age <= 10 ? $WARN : $BAD;
         $poll = "$dot_color*$RESET ${LABEL}Hot reload$RESET "
               . "${MUTED}- last poll$RESET $VALUE$last_hot_reload$RESET "
-              . "$MUTED($age_str)$RESET";
+              . "$MUTED(" . relative_age($age) . ")$RESET";
     }
     else {
         $poll = "${MUTED}o$RESET ${LABEL}Hot reload$RESET "
@@ -1227,7 +1275,9 @@ sub draw_status_bar {
 
     my $title  = "${LABEL}OVERPORT DEV SERVER$RESET";
     my $url    = "\e[4m${VALUE}http://$HOST:$PORT/$RESET";
-    my $counts = "${MUTED}polls $poll_count | reqs $request_count$RESET";
+    my $counts = $HOT_RELOAD_MODE eq 'push'
+        ? "${MUTED}pushes $ws_reload_count | reqs $request_count$RESET"
+        : "${MUTED}polls $poll_count | reqs $request_count$RESET";
 
     my $xfer_rate  = "${LABEL}Transfer$RESET ${MUTED}-$RESET $VALUE" . format_data_size(bytes_per_window()) . "/min$RESET";
     my $xfer_total = "${LABEL}Total sent$RESET ${MUTED}-$RESET $VALUE" . format_data_size($total_bytes_sent) . "$RESET";
@@ -1442,6 +1492,15 @@ sub settings_list {
         },
         {
             category => 'Development',
+            label    => 'Hot reload mode',
+            render   => sub { $HOT_RELOAD_MODE eq 'push' ? 'WebSocket (push)' : 'Poll (fetch)' },
+            toggle   => sub {
+                $HOT_RELOAD_MODE = $HOT_RELOAD_MODE eq 'push' ? 'poll' : 'push';
+                $settings_flash  = 'Refresh open pages to apply the new mode.';
+            },
+        },
+        {
+            category => 'Development',
             label    => 'Stress test rate',
             render   => sub { "$stress_test_rate req/s" },
             toggle   => sub {
@@ -1629,6 +1688,11 @@ sub draw_settings_box {
         push @lines, box_row($row_content, $inner);
     }
 
+    if (length $settings_flash) {
+        push @lines, box_row('', $inner);
+        push @lines, box_row("$WARN! $settings_flash$RESET", $inner);
+    }
+
     push @lines, $border;
     if ($settings_editing) {
         push @lines, box_row("${MUTED}Type digits and '.' | Backspace delete$RESET", $inner);
@@ -1697,7 +1761,8 @@ sub handle_settings_keys {
             }
         }
         elsif ($buf =~ s/^[sS\e]//) {
-            $settings_open = 0;
+            $settings_open  = 0;
+            $settings_flash = '';
             request_redraw();
             return;
         }
@@ -1834,6 +1899,7 @@ sub handle_keys {
         elsif ($buf =~ s/^[sS]//) {
             $settings_open  = 1;
             $settings_index = 0;
+            $settings_flash = '';
             request_redraw();
             return;
         }
@@ -1989,6 +2055,255 @@ sub web_root_signature {
     return md5_hex(join("\n", sort @entries));
 }
 
+# The snippet injected before </body>. In poll mode the browser drives the
+# check by fetching the signature; in push mode it opens a WebSocket and waits
+# for the server to tell it when to reload.
+sub hot_reload_script {
+    if ($HOT_RELOAD_MODE eq 'push') {
+        return <<"END_WS";
+<script>
+(function () {
+    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    var url = proto + location.host + '$HOT_RELOAD_PATH';
+    function connect() {
+        var ws;
+        try { ws = new WebSocket(url); }
+        catch (e) { setTimeout(connect, $HOT_RELOAD_POLL_MS); return; }
+        ws.onmessage = function (ev) {
+            if (ev.data === 'reload') location.reload();
+        };
+        ws.onclose = function () { setTimeout(connect, $HOT_RELOAD_POLL_MS); };
+        ws.onerror = function () { try { ws.close(); } catch (e) {} };
+    }
+    connect();
+})();
+</script>
+END_WS
+    }
+
+    return <<"END_POLL";
+<script>
+(function () {
+    var current = null;
+    function poll() {
+        fetch('$HOT_RELOAD_PATH', { cache: 'no-store' })
+            .then(function (res) { return res.text(); })
+            .then(function (sig) {
+                if (current === null) {
+                    current = sig;
+                } else if (sig !== current) {
+                    location.reload();
+                    return;
+                }
+                setTimeout(poll, $HOT_RELOAD_POLL_MS);
+            })
+            .catch(function () { setTimeout(poll, $HOT_RELOAD_POLL_MS); });
+    }
+    poll();
+})();
+</script>
+END_POLL
+}
+
+# ======================
+# WebSocket push transport (RFC 6455, subset)
+# ======================
+
+# Split a raw HTTP request into a lowercased-name => value header hash.
+sub parse_headers {
+    my ($request) = @_;
+
+    my %h;
+    my @lines = split(/\r?\n/, $request);
+    shift @lines;   # drop the request line
+
+    for my $line (@lines) {
+        last if $line eq '';
+        if ($line =~ /^([^:]+):\s*(.*?)\s*$/) {
+            $h{lc $1} = $2;
+        }
+    }
+
+    return \%h;
+}
+
+# Complete the opening handshake. Returns 1 on success.
+sub ws_handshake {
+    my ($client, $key) = @_;
+
+    my $accept = encode_base64(sha1($key . $WS_GUID), '');
+
+    my $response =
+        "HTTP/1.1 101 Switching Protocols\r\n" .
+        "Upgrade: websocket\r\n" .
+        "Connection: Upgrade\r\n" .
+        "Sec-WebSocket-Accept: $accept\r\n\r\n";
+
+    my $sent = syswrite($client, $response);
+    return 0 unless defined $sent;
+
+    record_transfer($sent);
+    return 1;
+}
+
+# Encode a server->client text frame (unmasked, per spec).
+sub ws_encode_text {
+    my ($payload) = @_;
+
+    my $len = length($payload);
+    my $header;
+    if ($len < 126) {
+        $header = pack('CC', 0x81, $len);
+    }
+    elsif ($len < 65536) {
+        $header = pack('CCn', 0x81, 126, $len);
+    }
+    else {
+        $header = pack('CCNN', 0x81, 127, 0, $len);
+    }
+
+    return $header . $payload;
+}
+
+# Drop a connection and re-baseline the monitor once the last client leaves.
+sub ws_remove_client {
+    my ($c) = @_;
+
+    @ws_clients = grep { $_ != $c } @ws_clients;
+    close $c->{fh} if $c->{fh};
+
+    $last_ws_signature = undef unless @ws_clients;
+    request_redraw();
+}
+
+# Consume whatever the client sent: honor close frames, answer pings, and
+# treat a dead socket as a disconnect. Everything else is ignored.
+sub ws_handle_readable {
+    my ($c) = @_;
+
+    my $chunk = '';
+    my $n = sysread($c->{fh}, $chunk, 4096);
+
+    unless (defined $n) {
+        return if $! == EINTR;
+        ws_remove_client($c);
+        return;
+    }
+
+    if ($n == 0) {
+        ws_remove_client($c);
+        return;
+    }
+
+    $c->{buf} .= $chunk;
+
+    while (1) {
+        my $buf = $c->{buf};
+        last if length($buf) < 2;
+
+        my $b0     = ord(substr($buf, 0, 1));
+        my $b1     = ord(substr($buf, 1, 1));
+        my $opcode = $b0 & 0x0f;
+        my $masked = ($b1 & 0x80) ? 1 : 0;
+        my $len    = $b1 & 0x7f;
+        my $offset = 2;
+
+        if ($len == 126) {
+            last if length($buf) < 4;
+            $len    = unpack('n', substr($buf, 2, 2));
+            $offset = 4;
+        }
+        elsif ($len == 127) {
+            last if length($buf) < 10;
+            my ($hi, $lo) = unpack('NN', substr($buf, 2, 8));
+            $len    = $lo;   # dev payloads never approach 4 GiB
+            $offset = 10;
+        }
+
+        my $mask_len = $masked ? 4 : 0;
+        last if length($buf) < $offset + $mask_len + $len;
+
+        my $mask    = $masked ? substr($buf, $offset, 4) : '';
+        my $payload = substr($buf, $offset + $mask_len, $len);
+
+        if ($masked) {
+            my @m = map { ord } split //, $mask;
+            my $out = '';
+            for my $i (0 .. length($payload) - 1) {
+                $out .= chr(ord(substr($payload, $i, 1)) ^ $m[$i % 4]);
+            }
+            $payload = $out;
+        }
+
+        substr($c->{buf}, 0, $offset + $mask_len + $len, '');
+
+        if ($opcode == 0x8) {          # close
+            syswrite($c->{fh}, pack('CC', 0x88, 0));
+            ws_remove_client($c);
+            return;
+        }
+        elsif ($opcode == 0x9) {       # ping -> pong (control payloads are < 126 bytes)
+            syswrite($c->{fh}, pack('CC', 0x8A, length($payload)) . $payload);
+        }
+        # text / binary / pong: nothing to do
+    }
+}
+
+# Tell every connected client to reload, pruning any that have gone away.
+sub ws_broadcast_reload {
+    my $frame = ws_encode_text('reload');
+
+    my @survivors;
+    for my $c (@ws_clients) {
+        if (defined syswrite($c->{fh}, $frame)) {
+            push @survivors, $c;
+        }
+        else {
+            close $c->{fh} if $c->{fh};
+        }
+    }
+    @ws_clients = @survivors;
+
+    $ws_reload_count++;
+    $last_ws_reload       = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    $last_ws_reload_epoch = time();
+
+    my $n = scalar @ws_clients;
+    push_log_records(
+        make_line("${GOOD}>> Hot reload pushed$RESET ${MUTED}- $n client" . ($n == 1 ? '' : 's') . " notified$RESET", 'center'),
+    );
+    play_tone('browser');
+}
+
+# While clients are connected, watch the web root and push a reload on change.
+sub ws_check_filesystem {
+    return unless @ws_clients;
+
+    my $now = Time::HiRes::time();
+    return if $now - $last_ws_scan_at < $WS_SCAN_INTERVAL;
+    $last_ws_scan_at = $now;
+
+    my $sig = web_root_signature();
+
+    if (!defined $last_ws_signature) {
+        $last_ws_signature = $sig;
+        return;
+    }
+
+    return if $sig eq $last_ws_signature;
+
+    $last_ws_signature = $sig;
+    ws_broadcast_reload();
+}
+
+sub log_ws_connect {
+    my ($ip) = @_;
+    my $n = scalar @ws_clients;
+    push_log_records(
+        make_line("${GOOD}o$RESET ${LABEL}Hot reload client connected$RESET ${MUTED}($ip) - $n active$RESET", 'center'),
+    );
+}
+
 # ======================
 # File serving
 # ======================
@@ -2043,8 +2358,9 @@ sub serve_static {
         my $body = do { local $/; <$fh> };
         close $fh;
 
-        unless ($body =~ s{</body>}{$HOT_RELOAD_SCRIPT</body>}i) {
-            $body .= $HOT_RELOAD_SCRIPT;
+        my $script = hot_reload_script();
+        unless ($body =~ s{</body>}{$script</body>}i) {
+            $body .= $script;
         }
 
         my $headers =
