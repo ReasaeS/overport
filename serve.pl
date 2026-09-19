@@ -6,7 +6,7 @@ use File::Basename;
 use File::Spec;
 use File::Path qw(make_path);
 use POSIX qw(strftime :termios_h);
-use Errno qw(EINTR);
+use Errno qw(EINTR EADDRINUSE);
 use Cwd qw(realpath getcwd);
 use URI::Escape;
 use File::Find;
@@ -731,7 +731,17 @@ $SIG{PIPE} = 'IGNORE';
 
 socket(my $server, PF_INET, SOCK_STREAM, getprotobyname('tcp')) or die "socket: $!";
 setsockopt($server, SOL_SOCKET, SO_REUSEADDR, 1) or die "setsockopt: $!";
-bind($server, sockaddr_in($PORT, inet_aton($HOST))) or die "bind: $!";
+
+my $START_PORT = $PORT;
+my $MAX_PORT    = 65535;
+
+while (!bind($server, sockaddr_in($PORT, inet_aton($HOST)))) {
+    die "bind: $!\n" unless $! == EADDRINUSE;
+    die "No free ports available (tried $START_PORT-$MAX_PORT)\n" if $PORT >= $MAX_PORT;
+    print STDERR "Port $PORT is in use, trying " . ($PORT + 1) . "...\n";
+    $PORT++;
+}
+
 listen($server, SOMAXCONN) or die "listen: $!";
 
 init_history();
