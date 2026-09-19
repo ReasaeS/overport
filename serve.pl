@@ -171,6 +171,11 @@ my $stress_test_child_pid;
 my $log_cleanup_enabled = 0;
 my $log_max_age         = 3600;
 
+my $network_access = 'local';   # 'local' (127.0.0.1) or 'lan' (0.0.0.0, all interfaces)
+my $lan_ip;                     # cached best-guess LAN-reachable address while $network_access eq 'lan'
+my $last_lan_ip_check = 0;
+my $LAN_IP_CHECK_INTERVAL = 10;
+
 my $settings_open    = 0;
 my $settings_index   = 0;
 my $settings_editing = 0;
@@ -729,11 +734,15 @@ my $SECURITY_HEADERS =
 # ======================
 $SIG{PIPE} = 'IGNORE';
 
-socket(my $server, PF_INET, SOCK_STREAM, getprotobyname('tcp')) or die "socket: $!";
-setsockopt($server, SOL_SOCKET, SO_REUSEADDR, 1) or die "setsockopt: $!";
-
 my $START_PORT = $PORT;
 my $MAX_PORT    = 65535;
+
+load_settings();
+$HOST = $network_access eq 'lan' ? '0.0.0.0' : '127.0.0.1';
+$lan_ip = detect_lan_ip() if $network_access eq 'lan';
+
+socket(my $server, PF_INET, SOCK_STREAM, getprotobyname('tcp')) or die "socket: $!";
+setsockopt($server, SOL_SOCKET, SO_REUSEADDR, 1) or die "setsockopt: $!";
 
 while (!bind($server, sockaddr_in($PORT, inet_aton($HOST)))) {
     die "bind: $!\n" unless $! == EADDRINUSE;
@@ -745,13 +754,12 @@ while (!bind($server, sockaddr_in($PORT, inet_aton($HOST)))) {
 listen($server, SOMAXCONN) or die "listen: $!";
 
 init_history();
-load_settings();
 rebuild_tone_wav();
 tui_init();
 
 push_log_records(
     make_rule('#'),
-    make_line("${LABEL}Server running at$RESET ${VALUE}http://$HOST:$PORT/$RESET", 'center'),
+    make_line("${LABEL}Server running at$RESET ${VALUE}http://" . display_host() . ":$PORT/$RESET", 'center'),
     make_line("${LABEL}Web root:$RESET $VALUE$REAL_WEB_ROOT$RESET", 'center'),
     make_line("${LABEL}Listening for requests...$RESET", 'center'),
     make_line("${WARN}WARNING: For local development only!$RESET", 'center'),
@@ -930,6 +938,77 @@ sub handle_client {
 }
 
 # ======================
+# Network access
+# ======================
+
+# Best-guess LAN-reachable address for this machine, found without sending
+# any traffic: a UDP "connect" just picks the local interface the kernel
+# would use to reach the given (unreachable) address, then we read it back.
+sub detect_lan_ip {
+    socket(my $probe, PF_INET, SOCK_DGRAM, getprotobyname('udp')) or return undef;
+    connect($probe, sockaddr_in(80, inet_aton('8.8.8.8'))) or do { close $probe; return undef; };
+
+    my $name = getsockname($probe);
+    close $probe;
+    return undef unless $name;
+
+    my (undef, $addr) = sockaddr_in($name);
+    my $ip = inet_ntoa($addr);
+    return ($ip && $ip ne '0.0.0.0') ? $ip : undef;
+}
+
+# The address to show the user for the current $network_access mode.
+sub display_host {
+    return '127.0.0.1' unless $network_access eq 'lan';
+    return $lan_ip // '0.0.0.0';
+}
+
+sub refresh_lan_ip {
+    return unless $network_access eq 'lan';
+
+    my $now = time();
+    return if $now - $last_lan_ip_check < $LAN_IP_CHECK_INTERVAL;
+    $last_lan_ip_check = $now;
+
+    $lan_ip = detect_lan_ip();
+}
+
+# Close the current listener and rebind to the address for $mode, trying the
+# current port first and falling back the same way the startup bind does.
+# Dies with a human-readable message on failure, leaving $server untouched.
+sub apply_network_access {
+    my ($mode) = @_;
+
+    my $new_host = $mode eq 'lan' ? '0.0.0.0' : '127.0.0.1';
+    return if $new_host eq $HOST;
+
+    socket(my $new_server, PF_INET, SOCK_STREAM, getprotobyname('tcp')) or die "socket: $!\n";
+    setsockopt($new_server, SOL_SOCKET, SO_REUSEADDR, 1) or die "setsockopt: $!\n";
+
+    my $port = $PORT;
+    while (!bind($new_server, sockaddr_in($port, inet_aton($new_host)))) {
+        die "bind: $!\n" unless $! == EADDRINUSE;
+        die "No free ports available (tried $PORT-$MAX_PORT)\n" if $port >= $MAX_PORT;
+        $port++;
+    }
+    listen($new_server, SOMAXCONN) or die "listen: $!\n";
+
+    close $server;
+    $server = $new_server;
+    $HOST   = $new_host;
+    $PORT   = $port;
+    $network_access = $mode;
+    $lan_ip = $mode eq 'lan' ? detect_lan_ip() : undef;
+
+    push_log_records(
+        make_line(''),
+        make_line("${LABEL}Network access changed$RESET ${MUTED}-$RESET now reachable at $VALUE"
+            . "http://" . display_host() . ":$PORT/$RESET", 'center'),
+        make_line(''),
+    );
+}
+
+# ======================
 # History persistence
 # ======================
 
@@ -1029,6 +1108,7 @@ sub load_settings {
     $log_cleanup_enabled    = $data->{log_cleanup_enabled}    if defined $data->{log_cleanup_enabled};
     $log_max_age            = $data->{log_max_age}            if defined $data->{log_max_age};
     $target_fps             = $data->{target_fps}             if defined $data->{target_fps};
+    $network_access         = ($data->{network_access} eq 'lan' ? 'lan' : 'local') if defined $data->{network_access};
 }
 
 sub save_settings {
@@ -1052,6 +1132,7 @@ sub save_settings {
             log_cleanup_enabled     => $log_cleanup_enabled,
             log_max_age             => $log_max_age,
             target_fps              => $target_fps,
+            network_access          => $network_access,
         }, $SETTINGS_FILE);
     };
 }
@@ -1252,6 +1333,7 @@ sub draw_status_bar {
     return '' unless $IS_TTY;
 
     sample_power();
+    refresh_lan_ip();
 
     my $inner = $TERM_COLS - 2;
 
@@ -1284,7 +1366,7 @@ sub draw_status_bar {
     }
 
     my $title  = "${LABEL}OVERPORT DEV SERVER$RESET";
-    my $url    = "\e[4m${VALUE}http://$HOST:$PORT/$RESET";
+    my $url    = "\e[4m${VALUE}http://" . display_host() . ":$PORT/$RESET";
     my $counts = $HOT_RELOAD_MODE eq 'push'
         ? "${MUTED}pushes $ws_reload_count | reqs $request_count$RESET"
         : "${MUTED}polls $poll_count | reqs $request_count$RESET";
@@ -1507,6 +1589,21 @@ sub settings_list {
             toggle   => sub {
                 $HOT_RELOAD_MODE = $HOT_RELOAD_MODE eq 'push' ? 'poll' : 'push';
                 $settings_flash  = 'Refresh open pages to apply the new mode.';
+            },
+        },
+        {
+            category => 'Development',
+            label    => 'Network access',
+            render   => sub { $network_access eq 'lan' ? 'LAN (all interfaces)' : 'Local only' },
+            toggle   => sub {
+                my $new_mode = $network_access eq 'lan' ? 'local' : 'lan';
+                my $ok = eval { apply_network_access($new_mode); 1 };
+                if ($ok) {
+                    $settings_flash = 'Now reachable at http://' . display_host() . ":$PORT/";
+                } else {
+                    my ($msg) = $@ =~ /^(.*)$/m;
+                    $settings_flash = "Could not switch: " . ($msg // 'unknown error');
+                }
             },
         },
         {
@@ -1831,7 +1928,9 @@ sub browser_launch_command {
 }
 
 sub open_browser {
-    my $url = "http://$HOST:$PORT/";
+    # Always target loopback here: 0.0.0.0 isn't a browsable address, and
+    # the machine running this command can always reach itself via it.
+    my $url = "http://127.0.0.1:$PORT/";
     my @launcher = browser_launch_command($url);
 
     unless (@launcher) {

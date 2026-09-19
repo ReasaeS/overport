@@ -12,7 +12,7 @@ const { spawn, execSync } = require('child_process');
 // Configuration
 // ======================
 let PORT = 9001;
-const HOST = '127.0.0.1';
+let HOST = '127.0.0.1';
 const START_PORT = PORT;
 const MAX_PORT = 65535;
 
@@ -150,6 +150,11 @@ let stressTestRunning = false;
 
 let logCleanupEnabled = false;
 let logMaxAge = 3600;
+
+let networkAccess = 'local'; // 'local' (127.0.0.1) or 'lan' (0.0.0.0, all interfaces)
+let lanIp;                   // cached best-guess LAN-reachable address while networkAccess === 'lan'
+let lastLanIpCheckAt = 0;
+const LAN_IP_CHECK_INTERVAL_MS = 10000;
 
 let settingsOpen = false;
 let settingsIndex = 0;
@@ -696,10 +701,100 @@ async function runStressTest() {
 const SECURITY_HEADERS = 'X-Content-Type-Options: nosniff\r\n' + 'X-Frame-Options: DENY\r\n';
 
 // ======================
+// Network access
+// ======================
+
+function bindHostFor(mode) {
+    return mode === 'lan' ? '0.0.0.0' : '127.0.0.1';
+}
+
+// Best-guess LAN-reachable address for this machine: the first non-internal
+// IPv4 address reported by the OS.
+function detectLanIp() {
+    const ifaces = os.networkInterfaces();
+    for (const name of Object.keys(ifaces)) {
+        for (const iface of ifaces[name] || []) {
+            if (iface.family === 'IPv4' && !iface.internal) return iface.address;
+        }
+    }
+    return undefined;
+}
+
+// The address to show the user for the current networkAccess mode.
+function displayHost() {
+    if (networkAccess !== 'lan') return '127.0.0.1';
+    return lanIp || '0.0.0.0';
+}
+
+function refreshLanIp() {
+    if (networkAccess !== 'lan') return;
+
+    const now = Date.now();
+    if (now - lastLanIpCheckAt < LAN_IP_CHECK_INTERVAL_MS) return;
+    lastLanIpCheckAt = now;
+
+    lanIp = detectLanIp();
+}
+
+// Close the current listener and rebind to the address for `mode`, trying
+// the current port first and falling back the same way the startup bind
+// does. Calls back with an Error on failure, leaving the live server untouched.
+function applyNetworkAccess(mode, cb) {
+    const newHost = bindHostFor(mode);
+    if (newHost === HOST) return cb(null);
+
+    const newServer = net.createServer(socket => handleClient(socket));
+    let tryPort = PORT;
+    let settled = false;
+
+    newServer.on('error', err => {
+        if (settled) return;
+
+        if (err.code === 'EADDRINUSE' && tryPort < MAX_PORT) {
+            tryPort++;
+            newServer.listen(tryPort, newHost);
+            return;
+        }
+
+        settled = true;
+        newServer.removeAllListeners();
+        try { newServer.close(); } catch (e) {}
+        cb(err.code === 'EADDRINUSE' ? new Error(`No free ports available (tried ${PORT}-${MAX_PORT})`) : err);
+    });
+
+    newServer.on('listening', () => {
+        settled = true;
+
+        const oldServer = server;
+        server = newServer;
+        HOST = newHost;
+        PORT = tryPort;
+        networkAccess = mode;
+        lanIp = mode === 'lan' ? detectLanIp() : undefined;
+
+        try { oldServer.close(); } catch (e) {}
+
+        pushLogRecords(
+            makeLine(''),
+            makeLine(`${LABEL}Network access changed${RESET} ${MUTED}-${RESET} now reachable at ${VALUE}http://${displayHost()}:${PORT}/${RESET}`, 'center'),
+            makeLine(''),
+        );
+
+        cb(null);
+    });
+
+    newServer.listen(tryPort, newHost);
+}
+
+// ======================
 // Socket setup
 // ======================
 
-const server = net.createServer(socket => handleClient(socket));
+loadSettings();
+HOST = bindHostFor(networkAccess);
+if (networkAccess === 'lan') lanIp = detectLanIp();
+
+let server = net.createServer(socket => handleClient(socket));
 
 server.on('error', err => {
     if (err.code === 'EADDRINUSE' && PORT < MAX_PORT) {
@@ -719,13 +814,12 @@ server.on('error', err => {
 
 server.on('listening', () => {
     initHistory();
-    loadSettings();
     rebuildToneWav();
     tuiInit();
 
     pushLogRecords(
         makeRule('#'),
-        makeLine(`${LABEL}Server running at${RESET} ${VALUE}http://${HOST}:${PORT}/${RESET}`, 'center'),
+        makeLine(`${LABEL}Server running at${RESET} ${VALUE}http://${displayHost()}:${PORT}/${RESET}`, 'center'),
         makeLine(`${LABEL}Web root:${RESET} ${VALUE}${REAL_WEB_ROOT}${RESET}`, 'center'),
         makeLine(`${LABEL}Listening for requests...${RESET}`, 'center'),
         makeLine(`${WARN}WARNING: For local development only!${RESET}`, 'center'),
@@ -972,6 +1066,7 @@ function loadSettings() {
     if (data.log_cleanup_enabled !== undefined) logCleanupEnabled = data.log_cleanup_enabled;
     if (data.log_max_age !== undefined) logMaxAge = data.log_max_age;
     if (data.target_fps !== undefined) targetFps = data.target_fps;
+    if (data.network_access !== undefined) networkAccess = data.network_access === 'lan' ? 'lan' : 'local';
 }
 
 function saveSettings() {
@@ -995,6 +1090,7 @@ function saveSettings() {
             log_cleanup_enabled: logCleanupEnabled,
             log_max_age: logMaxAge,
             target_fps: targetFps,
+            network_access: networkAccess,
         }));
     } catch (e) { /* best-effort persistence */ }
 }
@@ -1186,6 +1282,7 @@ function drawStatusBar() {
     if (!IS_TTY) return '';
 
     samplePower();
+    refreshLanIp();
 
     const inner = TERM_COLS - 2;
 
@@ -1215,7 +1312,7 @@ function drawStatusBar() {
     }
 
     const title = `${LABEL}OVERPORT DEV SERVER${RESET}`;
-    const url = `\x1b[4m${VALUE}http://${HOST}:${PORT}/${RESET}`;
+    const url = `\x1b[4m${VALUE}http://${displayHost()}:${PORT}/${RESET}`;
     const counts = HOT_RELOAD_MODE === 'push'
         ? `${MUTED}pushes ${wsReloadCount} | reqs ${requestCount}${RESET}`
         : `${MUTED}polls ${pollCount} | reqs ${requestCount}${RESET}`;
@@ -1425,6 +1522,22 @@ function settingsList() {
             toggle: () => {
                 HOT_RELOAD_MODE = HOT_RELOAD_MODE === 'push' ? 'poll' : 'push';
                 settingsFlash = 'Refresh open pages to apply the new mode.';
+            },
+        },
+        {
+            category: 'Development', label: 'Network access',
+            render: () => networkAccess === 'lan' ? 'LAN (all interfaces)' : 'Local only',
+            toggle: () => {
+                const newMode = networkAccess === 'lan' ? 'local' : 'lan';
+                applyNetworkAccess(newMode, err => {
+                    if (err) {
+                        settingsFlash = `Could not switch: ${err.message}`;
+                    } else {
+                        settingsFlash = `Now reachable at http://${displayHost()}:${PORT}/`;
+                        saveSettings();
+                    }
+                    requestRedraw();
+                });
             },
         },
         {
@@ -1692,7 +1805,9 @@ function browserLaunchCommand(url) {
 }
 
 function openBrowser() {
-    const url = `http://${HOST}:${PORT}/`;
+    // Always target loopback here: 0.0.0.0 isn't a browsable address, and
+    // the machine running this command can always reach itself via it.
+    const url = `http://127.0.0.1:${PORT}/`;
     const launcher = browserLaunchCommand(url);
 
     if (!launcher.length) {
